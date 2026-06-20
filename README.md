@@ -49,6 +49,15 @@ your dispatch ── admit(model, ctx, priority) ─► Broker (memory-fit + hea
 
 Sweet spot: **LM Studio-style shared multi-model servers with multiple independent clients.** Useful on Ollama for the *priority/admission* layer. Not a fit for single-model-per-process vLLM.
 
+## Install
+
+```sh
+pip install .          # regular install
+pip install -e .       # editable (dev); needs pip >= 21.3 (PEP 660) — `pip install -U pip` if older
+```
+
+Stdlib-only core (no runtime deps); `pytest`/`pytest-asyncio` only for the test suite. Verified end-to-end against live LM Studio: a fresh venv with nothing but this package installed can admit + load + reap a real model.
+
 ## Quick start (LM Studio)
 
 ```python
