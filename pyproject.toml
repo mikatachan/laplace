@@ -5,7 +5,7 @@ description = "Priority-aware admission control + idle/external-tenant model rea
 authors = [{ name = "mikatachan" }]
 readme = "README.md"
 license = { text = "MIT" }
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 dependencies = []  # stdlib-only core; adapters bring their own (e.g. lms CLI)
 
 [project.optional-dependencies]

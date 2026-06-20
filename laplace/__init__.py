@@ -1,11 +1,17 @@
-"""Laplace — priority-aware admission + idle/external-tenant reaping for a shared local LLM pool.
+"""Laplace public API."""
 
-Public API (settling during extraction — see EXTRACTION.md):
-    ContentionBroker, Reaper, PriorityTier, resolve_priority, InferenceAdapter
+from laplace.adapter import InferenceAdapter, LoadedModel
+from laplace.broker import ContentionBroker
+from laplace.priority import PriorityTier, resolve_priority
+from laplace.reaper import Reaper
 
-The core (broker/reaper/priority) is engine-agnostic and depends only on an
-``InferenceAdapter``. Concrete adapters live under ``laplace.adapters`` — the
-LM Studio adapter is the reference implementation.
-"""
+__all__ = [
+    "ContentionBroker",
+    "InferenceAdapter",
+    "LoadedModel",
+    "PriorityTier",
+    "Reaper",
+    "resolve_priority",
+]
 
 __version__ = "0.1.0"

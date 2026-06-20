@@ -52,18 +52,25 @@ Sweet spot: **LM Studio-style shared multi-model servers with multiple independe
 ## Quick start (LM Studio)
 
 ```python
-from laplace import ContentionBroker, Reaper, resolve_priority
+from laplace import ContentionBroker, Reaper
 from laplace.adapters.lmstudio import LMStudioAdapter
 
-adapter = LMStudioAdapter()                 # wraps the `lms` CLI / `lms ps --json`
-broker  = ContentionBroker(adapter)
-reaper  = Reaper(adapter); reaper.set_broker(broker)
-reaper.start_sweep_loop()                   # 60s background sweep
+adapter = LMStudioAdapter()
+reaper = Reaper(adapter, keep_loaded={"nomic-embed-text"})
+broker = ContentionBroker(adapter, reaper, budget_mb=87040)
+reaper.start_sweep_loop()
 
-# at your one dispatch chokepoint:
 decision = await broker.admit(model_id, context_length, priority="interactive")
 if decision == "backpressure":
     ...  # 503 / retry
+
+reaper.acquire(model_id)
+try:
+    await adapter.ensure_loaded(model_id, context_length)
+    ...
+finally:
+    reaper.release(model_id)
+    await broker.done(model_id)
 ```
 
 *(API is settling as the extraction lands — see `EXTRACTION.md`.)*

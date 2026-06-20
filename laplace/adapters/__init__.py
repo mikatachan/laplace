@@ -1,1 +1,5 @@
-"""Engine adapters: implement InferenceAdapter for a runtime (LM Studio, Ollama, ...)."""
+"""Engine adapters for Laplace."""
+
+from laplace.adapters.lmstudio import LMStudioAdapter
+
+__all__ = ["LMStudioAdapter"]
