@@ -30,7 +30,7 @@ your dispatch ── admit(model, ctx, priority) ─► Broker (memory-fit + hea
                                                    ▼
                                             InferenceAdapter  ◄── LMStudioAdapter (reference)
                                             (list_loaded / footprint /            OllamaAdapter (todo)
-                                             ensure_loaded / force_unload /        vLLMAdapter (n/a-ish)
+                                             ensure_loaded / force_unload /        vLLMAdapter (n/a)
                                              activity: status/last_used/queued)
 ```
 
@@ -39,7 +39,7 @@ your dispatch ── admit(model, ctx, priority) ─► Broker (memory-fit + hea
 - **Priority** — 3 server-derived tiers.
 - **InferenceAdapter** — the small engine boundary you implement per runtime.
 
-## Engine fit (be honest with yourself)
+## Engine fit by runtime
 
 | | LM Studio | Ollama | vLLM |
 |---|---|---|---|
