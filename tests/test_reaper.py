@@ -302,6 +302,37 @@ def test_concurrent_a_fails_b_succeeds_keeps_managed():
 
 
 @pytest.mark.asyncio
+async def test_mark_managed_without_prior_touch_survives_sweep_within_ttl():
+    # mark_managed is a claim of imminent use: a marked model whose _last_used
+    # is unset must not read as infinitely idle and get reaped during the load
+    # window before acquire records its first touch.
+    reaper, adapter = _reaper(loaded=[loaded_model("big/model", size_bytes=30 * _GIB)])
+    reaper.mark_managed("big/model")
+    await reaper.sweep_loaded()
+    assert adapter.force_unload_calls == []
+
+
+def test_unmark_managed_is_noop_while_in_flight():
+    # A concurrent caller holding the model in flight must not have it flipped
+    # to external mid-call by another caller's unmark.
+    reaper, _adapter = _reaper()
+    model = "qwen3.6-27b-mlx"
+    reaper.acquire(model)
+    assert reaper.in_flight(model) == 1
+    reaper.unmark_managed(model)
+    assert reaper.is_managed(model) is True
+
+
+def test_unmark_managed_works_when_not_in_flight():
+    reaper, _adapter = _reaper()
+    model = "qwen3.6-27b-mlx"
+    reaper.mark_managed(model)
+    assert reaper.in_flight(model) == 0
+    reaper.unmark_managed(model)
+    assert reaper.is_managed(model) is False
+
+
+@pytest.mark.asyncio
 async def test_run_sweep_loop_survives_exception_and_stops(monkeypatch: pytest.MonkeyPatch):
     reaper, _adapter = _reaper()
     call_count = 0

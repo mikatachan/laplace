@@ -115,10 +115,14 @@ class Reaper:
     def mark_managed(self, model_id: str) -> None:
         """Claim a model as daemon-managed before acquire.
 
-        Callers mark a resident model up front so the idle-TTL sweep does not
-        treat it as an external tenant during the load/acquire window.
+        Marking is a claim of imminent use: callers mark a resident model up
+        front so the idle-TTL sweep does not treat it as an external tenant
+        during the load/acquire window. The mark also records a touch so an
+        unset _last_used is not read as infinitely idle and reaped before
+        acquire records its first touch.
         """
         self._mark_managed(model_id)
+        self._last_used[model_id] = time.monotonic()
 
     def is_managed(self, model_id: str) -> bool:
         if not model_id:
@@ -130,11 +134,16 @@ class Reaper:
 
         Safe only under the caller's first-touch rule: unmark when this caller
         took first touch, never acquired, and no other call holds the model.
+        A no-op while the model is in flight, so a caller race cannot flip an
+        actively-used model to external mid-call.
         """
         if not model_id:
             return
+        base_id = self.adapter.base_id(model_id)
+        if self._in_flight.get(model_id, 0) > 0 or self._in_flight.get(base_id, 0) > 0:
+            return
         self._managed.discard(model_id)
-        self._managed.discard(self.adapter.base_id(model_id))
+        self._managed.discard(base_id)
 
     def evictable_models(self, resident: list[str]) -> list[str]:
         self._reconcile_base_index(resident)
