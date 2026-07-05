@@ -161,11 +161,14 @@ kickstart_gateway() {
 }
 
 # --- (f) verify reconnect + daemon log clean --------------------------------
+# The gateway.log offset MUST be captured by the caller BEFORE launchctl
+# kickstart (mirrors rollback-hermes.sh), otherwise a normal fast reconnect
+# lands behind the offset and this function false-warns "consider rollback" on a
+# genuinely successful cutover.
 verify_live() {
+    local start_lines="$1"
     say "VERIFY — gateway reconnect + daemon log"
-    local start_lines
-    start_lines="$(wc -l < "${GW_LOG}" 2>/dev/null || echo 0)"
-    info "gateway.log line offset before kickstart: ${start_lines}"
+    info "gateway.log line offset (captured before kickstart): ${start_lines}"
     info "waiting up to 30s for '✓ discord connected' after the kickstart..."
     local connected=0 i
     for i in $(seq 1 30); do
@@ -218,10 +221,15 @@ main() {
     run_prechecks
     backup_config
     edit_config
+    # Capture the gateway.log offset BEFORE kickstart so a fast reconnect is not
+    # missed (see verify_live). Mirrors rollback-hermes.sh:29-31.
+    local gw_offset
+    gw_offset="$(wc -l < "${GW_LOG}" 2>/dev/null || echo 0)"
+    info "gateway.log line offset before kickstart: ${gw_offset}"
     kickstart_gateway
-    say "SETTLE — waiting 15s for the gateway to come up"
-    sleep 15
-    verify_live
+    # No fixed pre-verify sleep: verify_live polls up to 30s for the reconnect
+    # line from the pre-kickstart offset, which subsumes any settle wait.
+    verify_live "${gw_offset}"
     next_steps
     say "DONE — Hermes cutover applied"
 }
