@@ -43,7 +43,9 @@ for i in $(seq 1 "${N}"); do
     # Parse one snapshot: print a table row per loaded model, append a JSONL
     # summary line for the final aggregation. Field precedence mirrors
     # laplace/adapters/lmstudio.py (_entry_identifier/_entry_size_bytes/_entry_status).
-    printf '%s' "${raw}" | TS="${ts}" IDX="${i}" NTOTAL="${N}" \
+    # NOTE: the JSON must ride an env var, not a pipe: python3 <<heredoc takes
+    # its PROGRAM from stdin, so piped data would be silently discarded.
+    RAW="${raw}" TS="${ts}" IDX="${i}" NTOTAL="${N}" \
         FA="${FOCUS_A_MATCH}" FB="${FOCUS_B_MATCH}" SNAP="${SNAP}" python3 <<'PY'
 import json, os, sys
 
@@ -73,7 +75,7 @@ def status(e):
     return v.lower() if isinstance(v, str) and v else "-"
 
 try:
-    data = json.loads(sys.stdin.read() or "[]")
+    data = json.loads(os.environ.get("RAW") or "[]")
 except Exception as exc:
     print("  [%s/%s] %s  parse error: %s" % (idx, ntotal, ts, exc))
     data = []
