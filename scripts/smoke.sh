@@ -63,7 +63,7 @@ say "STEP 2 — /readyz 200 (LM Studio up)"
 code="$(curl -sS -o "${TMP}/readyz" -w '%{http_code}' "${BASE}/readyz")"
 info "http ${code} body=$(cat "${TMP}/readyz")"
 [[ "${code}" == "200" ]] && ok "readyz 200 (upstream reachable)" || bad "readyz expected 200 got ${code}"
-info "readyz 503 path (documented, NOT exercised on this multi-tenant box): with LM Studio stopped, /readyz returns 503 with reason 'upstream /v1/models not 200 within 5s' and/or 'lms ps not rc 0 within 10s'"
+info "readyz 503 path (documented, NOT exercised on this multi-tenant box): with LM Studio stopped, /readyz returns 503 with reason 'upstream /v1/models unreachable within 5s' and/or 'lms ps not rc 0 within 10s' (an HTTP 401/404 from upstream counts as reachable)"
 
 # ===========================================================================
 say "STEP 3 — non-streaming chat via /other/v1/chat/completions"
