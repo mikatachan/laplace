@@ -103,18 +103,51 @@ class ContentionBroker:
                 async with self._lock:
                     self._remove_waiter(entry)
                 return "backpressure"
+            except asyncio.CancelledError:
+                # The admit() task was cancelled while parked on the heap. Without
+                # this cleanup the entry lingers in self._waiters until a later
+                # _wake() happens to pop it: heap bloat under a cancel-heavy
+                # workload. Remove it, then re-raise to preserve cancellation.
+                # Acquiring the lock is itself a cancellation point, so retry the
+                # guarded removal across re-cancellation; the lock is held only
+                # for the O(n) heap remove, never across an await, so this
+                # terminates for one-shot and bounded cancellation.
+                while True:
+                    try:
+                        async with self._lock:
+                            self._remove_waiter(entry)
+                        break
+                    except asyncio.CancelledError:
+                        continue
+                raise
             evicted_this_cycle = False
 
     async def done(self, model_id: str) -> None:
         if not model_id:
             return
-        async with self._lock:
-            count = self._reserved.get(model_id, 0) - 1
-            if count > 0:
-                self._reserved[model_id] = count
-            else:
-                self._reserved.pop(model_id, None)
-            self._wake()
+        # Cancellation safety: acquiring the lock is a cancellation point, so a
+        # second cancel thrown into the acquire could abort this before the
+        # refcount is decremented and leak the reservation, leaving
+        # _active_calls() elevated against phantom load. Retry the guarded
+        # release across re-cancellation; the decrement runs exactly once
+        # (guarded by `released`), so retrying never double-releases.
+        released = False
+        while True:
+            try:
+                async with self._lock:
+                    if not released:
+                        count = self._reserved.get(model_id, 0) - 1
+                        if count > 0:
+                            self._reserved[model_id] = count
+                        else:
+                            self._reserved.pop(model_id, None)
+                        released = True
+                    self._wake()
+                return
+            except asyncio.CancelledError:
+                if released:
+                    raise
+                continue
 
     async def notify_freed(self, freed_mb: int | None = None) -> None:
         if freed_mb is not None:
@@ -226,12 +259,22 @@ class ContentionBroker:
             out, err = await asyncio.wait_for(proc.communicate(), timeout=30.0)
             text = (out or b"").decode().strip()
             if proc.returncode == 0 and text.isdigit():
-                return int(text)
-            log.warning(
-                "laplace.broker: sysctl iogpu.wired_limit_mb failed (rc=%s): %s",
-                proc.returncode,
-                ((err or out) or b"").decode().strip()[:160],
-            )
+                value = int(text)
+                if value > 0:
+                    return value
+                # sysctl reports 0 when the wired limit is system-managed, not an
+                # actual 0 MB budget. Fall through to the default so admission is
+                # not starved to total backpressure.
+                log.info(
+                    "laplace.broker: iogpu.wired_limit_mb=0 (system-managed); "
+                    "using default budget",
+                )
+            else:
+                log.warning(
+                    "laplace.broker: sysctl iogpu.wired_limit_mb failed (rc=%s): %s",
+                    proc.returncode,
+                    ((err or out) or b"").decode().strip()[:160],
+                )
         except Exception as exc:  # noqa: BLE001
             log.warning("laplace.broker: sysctl read failed: %s", exc)
         return 90112

@@ -4,12 +4,29 @@ import asyncio
 
 import pytest
 
+from laplace import broker as broker_module
 from laplace.broker import ContentionBroker
 from laplace.priority import from_legacy_string
 from laplace.reaper import Reaper
 from tests.fakes import FakeAdapter, loaded_model
 
 _GIB = 1024 ** 3
+
+
+class _FakeProc:
+    def __init__(self, stdout: bytes, returncode: int = 0):
+        self._stdout = stdout
+        self.returncode = returncode
+
+    async def communicate(self):
+        return self._stdout, b""
+
+
+def _patch_sysctl(monkeypatch: pytest.MonkeyPatch, stdout: bytes, returncode: int = 0):
+    async def fake_exec(*args, **kwargs):
+        return _FakeProc(stdout, returncode)
+
+    monkeypatch.setattr(broker_module.asyncio, "create_subprocess_exec", fake_exec)
 
 
 def _broker(adapter: FakeAdapter, *, budget_mb: int = 87040, timeout_s: float = 0.1, max_concurrent: int = 2):
@@ -204,3 +221,65 @@ async def test_broker_passes_priority_tier_to_request_free(monkeypatch: pytest.M
     monkeypatch.setattr(reaper, "request_free", wrapped)
     assert await broker.admit("openai/gpt-oss-120b", priority="interactive") == "admit"
     assert seen == [from_legacy_string("interactive")]
+
+
+@pytest.mark.asyncio
+async def test_sysctl_zero_wired_limit_falls_through_to_default(monkeypatch: pytest.MonkeyPatch):
+    # sysctl returns "0" when the wired limit is system-managed. isdigit() alone
+    # accepts "0", which would make the budget 0 and backpressure everything.
+    adapter = FakeAdapter()
+    reaper = Reaper(adapter)
+    broker = ContentionBroker(adapter, reaper, budget_mb=None)
+    _patch_sysctl(monkeypatch, b"0\n", returncode=0)
+    assert await broker._budget_mb() == 90112 - 3072
+
+
+@pytest.mark.asyncio
+async def test_sysctl_positive_wired_limit_is_honored(monkeypatch: pytest.MonkeyPatch):
+    adapter = FakeAdapter()
+    reaper = Reaper(adapter)
+    broker = ContentionBroker(adapter, reaper, budget_mb=None)
+    _patch_sysctl(monkeypatch, b"120000\n", returncode=0)
+    assert await broker._budget_mb() == 120000 - 3072
+
+
+@pytest.mark.asyncio
+async def test_done_releases_reservation_despite_cancel_in_lock():
+    adapter = FakeAdapter(footprints={"model/x": 1000})
+    broker, _ = _broker(adapter, timeout_s=5.0)
+    broker._reserve("model/x")
+    assert broker._active_calls() == 1
+
+    # Hold the lock so done() parks on acquire, then cancel it there.
+    await broker._lock.acquire()
+    task = asyncio.create_task(broker.done("model/x"))
+    await asyncio.sleep(0.01)
+    task.cancel()
+    await asyncio.sleep(0)
+    broker._lock.release()
+    await task
+
+    assert broker._active_calls() == 0
+
+
+@pytest.mark.asyncio
+async def test_cancelled_parked_waiter_removed_from_heap():
+    adapter = FakeAdapter(
+        loaded=[loaded_model("qwen/qwen3-coder-30b", size_bytes=17 * _GIB)],
+        footprints={
+            "qwen/qwen3-coder-30b": 22000,
+            "openai/gpt-oss-120b": 85000,
+        },
+    )
+    broker, reaper = _broker(adapter, timeout_s=5.0)
+    reaper.acquire("qwen/qwen3-coder-30b")
+
+    task = asyncio.create_task(broker.admit("openai/gpt-oss-120b"))
+    await asyncio.sleep(0.05)
+    assert len(broker._waiters) == 1
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert broker._waiters == []
