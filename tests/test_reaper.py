@@ -226,6 +226,81 @@ async def test_sweep_notifies_broker_after_unload():
     assert notified == [int(31 * _GIB / (1024 * 1024))]
 
 
+def test_managed_primitives_report_and_restore():
+    reaper, _adapter = _reaper()
+    model = "qwen3-next-80b-a3b-thinking"
+    assert reaper.is_managed(model) is False
+    reaper.mark_managed(model)
+    assert reaper.is_managed(model) is True
+    reaper.unmark_managed(model)
+    assert reaper.is_managed(model) is False
+
+
+@pytest.mark.asyncio
+async def test_mark_managed_protects_external_resident_before_acquire():
+    # Without the mark, an idle external resident is swept after two sweeps.
+    r_ext, a_ext = _reaper(loaded=[_external_entry()])
+    await r_ext.sweep_loaded()
+    await r_ext.sweep_loaded()
+    assert a_ext.force_unload_calls == [_EXTERNAL_ID]
+
+    # With mark_managed claimed before acquire, the model is no longer external
+    # and, while recently touched, is protected from the sweep. The fresh touch
+    # stands in for acquire()'s touch in the real lifecycle.
+    r_mk, a_mk = _reaper(loaded=[_external_entry()])
+    r_mk.mark_managed(_EXTERNAL_ID)
+    r_mk._last_used[_EXTERNAL_ID] = time.monotonic()
+    assert r_mk.is_managed(_EXTERNAL_ID) is True
+    await r_mk.sweep_loaded()
+    await r_mk.sweep_loaded()
+    assert a_mk.force_unload_calls == []
+
+
+def test_unmark_on_failed_load_of_previously_external_model():
+    # B2 amendment (i): a first-touch mark on a previously-external model, an
+    # aborted load, and the caller's unmark restore external status.
+    reaper, _adapter = _reaper()
+    model = "qwen3.6-27b-mlx"
+    first_touch = not reaper.is_managed(model)
+    assert first_touch is True
+    reaper.mark_managed(model)
+    assert reaper.is_managed(model) is True
+    acquired = False
+    if first_touch and not acquired and reaper.in_flight(model) == 0:
+        reaper.unmark_managed(model)
+    assert reaper.is_managed(model) is False
+
+
+def test_previously_managed_model_stays_managed_on_failed_load():
+    # B2 amendment (ii): a model already managed is not first-touch, so a failed
+    # load never unmarks it.
+    reaper, _adapter = _reaper()
+    model = "qwen3.6-27b-mlx"
+    reaper.mark_managed(model)
+    first_touch = not reaper.is_managed(model)
+    assert first_touch is False
+    acquired = False
+    if first_touch and not acquired and reaper.in_flight(model) == 0:
+        reaper.unmark_managed(model)
+    assert reaper.is_managed(model) is True
+
+
+def test_concurrent_a_fails_b_succeeds_keeps_managed():
+    # B2 amendment (iii): A takes first touch then fails while B acquires the
+    # same model. A's cleanup is blocked by B's in_flight, so the model stays
+    # managed and B is unaffected.
+    reaper, _adapter = _reaper()
+    model = "qwen3.6-27b-mlx"
+    first_touch_a = not reaper.is_managed(model)
+    reaper.mark_managed(model)
+    reaper.acquire(model)  # B acquires: in_flight + re-mark
+    acquired_a = False
+    if first_touch_a and not acquired_a and reaper.in_flight(model) == 0:
+        reaper.unmark_managed(model)
+    assert reaper.is_managed(model) is True
+    assert reaper.in_flight(model) == 1
+
+
 @pytest.mark.asyncio
 async def test_run_sweep_loop_survives_exception_and_stops(monkeypatch: pytest.MonkeyPatch):
     reaper, _adapter = _reaper()

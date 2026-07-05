@@ -112,6 +112,30 @@ class Reaper:
     def in_flight(self, model_id: str) -> int:
         return self._in_flight.get(model_id, 0)
 
+    def mark_managed(self, model_id: str) -> None:
+        """Claim a model as daemon-managed before acquire.
+
+        Callers mark a resident model up front so the idle-TTL sweep does not
+        treat it as an external tenant during the load/acquire window.
+        """
+        self._mark_managed(model_id)
+
+    def is_managed(self, model_id: str) -> bool:
+        if not model_id:
+            return False
+        return model_id in self._managed or self.adapter.base_id(model_id) in self._managed
+
+    def unmark_managed(self, model_id: str) -> None:
+        """Release a managed claim (first-touch rollback on a failed load).
+
+        Safe only under the caller's first-touch rule: unmark when this caller
+        took first touch, never acquired, and no other call holds the model.
+        """
+        if not model_id:
+            return
+        self._managed.discard(model_id)
+        self._managed.discard(self.adapter.base_id(model_id))
+
     def evictable_models(self, resident: list[str]) -> list[str]:
         self._reconcile_base_index(resident)
         candidates = [
