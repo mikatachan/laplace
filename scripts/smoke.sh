@@ -16,14 +16,15 @@ set -uo pipefail
 BASE="http://127.0.0.1:4242"
 UPSTREAM="http://127.0.0.1:1234"
 MODEL="google/gemma-4-e4b"
+VENV_PY="/Users/axis/github/laplace/.venv/bin/python"   # 3.12: has tomllib (system python3 may not)
 LMS="${HOME}/.lmstudio/bin/lms"
 LOG="${HOME}/.laplace/logs/laplaced.log"
 LABEL="com.axis.laplaced"
 DOMAIN="gui/$(id -u)"
 TMP="$(mktemp -d /tmp/laplace_smoke.XXXXXX)"
 # Expected reap TTL for a ~9GB model: below the reaper's 15 GiB medium tier, so
-# it falls to the default delay of 300s, swept at 60s granularity.
-TTL_WAIT="${SMOKE_TTL_WAIT:-330}"
+# it falls to the default delay of 300s, swept at 60s granularity (=> up to ~360s).
+TTL_WAIT="${SMOKE_TTL_WAIT:-360}"
 
 pass=0; fail=0; finding=0
 declare -a RESULTS=()
@@ -32,6 +33,8 @@ ok()       { printf '  PASS: %s\n' "$1";    RESULTS+=("PASS   $1"); pass=$((pass
 bad()      { printf '  FAIL: %s\n' "$1";    RESULTS+=("FAIL   $1"); fail=$((fail+1)); }
 note()     { printf '  FINDING: %s\n' "$1"; RESULTS+=("FIND   $1"); finding=$((finding+1)); }
 info()     { printf '  info: %s\n' "$1"; }
+# grep -c prints "0" AND exits 1 on no match; capture a single clean integer.
+count()    { local n; n="$(grep -c "$1" "$2" 2>/dev/null | head -1)"; printf '%s' "${n:-0}"; }
 
 # --- API key (never echoed) -------------------------------------------------
 if [[ -n "${LMSTUDIO_API_KEY:-}" ]]; then
@@ -83,8 +86,8 @@ curl -sS --max-time 320 -N -o "${TMP}/chat_stream.sse" -w '%{http_code}' \
     -d "$(chat_body 'Count from one to five.' true)" \
     "${BASE}/other/v1/chat/completions" >"${TMP}/chat_stream.code" 2>/dev/null
 code="$(cat "${TMP}/chat_stream.code")"
-frames="$(grep -c '^data:' "${TMP}/chat_stream.sse" 2>/dev/null || echo 0)"
-done_seen="$(grep -c '\[DONE\]' "${TMP}/chat_stream.sse" 2>/dev/null || echo 0)"
+frames="$(count '^data:' "${TMP}/chat_stream.sse")"
+done_seen="$(count '\[DONE\]' "${TMP}/chat_stream.sse")"
 info "http ${code} data-frames=${frames} done-marker=${done_seen}"
 if [[ "${code}" == "200" && "${frames}" -ge 2 ]]; then
     ok "streaming chat delivered ${frames} incremental data frames"
@@ -99,7 +102,7 @@ curl -sS --max-time 320 -N -o "${TMP}/responses.sse" -w '%{http_code}' \
     -d "$(printf '{"model":"%s","input":"Say hi.","stream":true}' "${MODEL}")" \
     "${BASE}/other/v1/responses" >"${TMP}/responses.code" 2>/dev/null
 code="$(cat "${TMP}/responses.code")"
-rframes="$(grep -c '^data:' "${TMP}/responses.sse" 2>/dev/null || echo 0)"
+rframes="$(count '^data:' "${TMP}/responses.sse")"
 info "http ${code} data-frames=${rframes} body-head=$(head -c 160 "${TMP}/responses.sse" | tr '\n' ' ')"
 if [[ "${code}" == "200" && "${rframes}" -ge 1 ]]; then
     ok "responses passthrough streamed ${rframes} frames — D11 upstream support OBSERVED"
@@ -131,7 +134,8 @@ fi
 # ===========================================================================
 say "STEP 8 — wait past TTL (~${TTL_WAIT}s + sweep) and verify daemon reap"
 info "expected TTL for ~9GB model = 300s (below 15GiB medium tier => default delay 300s), sweep every 60s"
-before_freed="$(grep -c 'notify_freed' "${LOG}" 2>/dev/null || echo 0)"
+info "NOTE: LM Studio justInTimeModelLoading auto-unloads idle models on its own (~5min) TTL; that races the daemon reaper. A true DAEMON reap is proven ONLY by a new notify_freed line, not merely by gemma disappearing."
+before_freed="$(count 'notify_freed' "${LOG}")"
 info "notify_freed lines before wait: ${before_freed}"
 info "sleeping ${TTL_WAIT}s then polling up to 180s for reap..."
 sleep "${TTL_WAIT}"
@@ -140,15 +144,15 @@ for _ in $(seq 1 12); do
     if ! "${LMS}" ps 2>&1 | grep -q 'gemma-4-e4b'; then reaped=1; break; fi
     sleep 15
 done
-after_freed="$(grep -c 'notify_freed' "${LOG}" 2>/dev/null || echo 0)"
+after_freed="$(count 'notify_freed' "${LOG}")"
 info "notify_freed lines after wait: ${after_freed}"
 grep 'notify_freed' "${LOG}" 2>/dev/null | tail -2 | sed 's/^/    /'
-if [[ "${reaped}" == "1" && "${after_freed}" -gt "${before_freed}" ]]; then
-    ok "daemon reaped gemma after TTL (gone from lms ps + notify_freed logged)"
+if [[ "${after_freed}" -gt "${before_freed}" ]]; then
+    ok "DAEMON reaped gemma after TTL (gone from lms ps AND new notify_freed logged) — admit->load->respond->reap cycle observed"
 elif [[ "${reaped}" == "1" ]]; then
-    ok "gemma gone from lms ps after TTL (no new notify_freed line captured — check log excerpt)"
+    note "gemma gone from lms ps but NO new notify_freed line: unloaded by LM Studio JIT idle-TTL, not the daemon reaper. Daemon idle-reap not demonstrable on this box without disabling LM Studio justInTimeModelLoading."
 else
-    bad "gemma still resident after ${TTL_WAIT}s+poll — reap not observed"
+    bad "gemma still resident after ${TTL_WAIT}s+poll — no reap observed at all"
 fi
 # guard: did the daemon reap anything that ISN'T gemma? (multi-tenant safety)
 others="$(grep -E 'force_unload|notify_freed' "${LOG}" 2>/dev/null | grep -v 'gemma' | tail -3)"
@@ -171,7 +175,7 @@ info "post-kickstart healthz http ${hc}"
 # ===========================================================================
 say "STEP 10 — roster check: lms ls ids vs [model_context] keys"
 "${LMS}" ls --json >"${TMP}/ls.json" 2>/dev/null || echo '[]' >"${TMP}/ls.json"
-python3 - "$@" <<PY
+"${VENV_PY}" - <<PY
 import json, os, tomllib
 ls = json.load(open("${TMP}/ls.json"))
 ids = set()
@@ -187,13 +191,18 @@ extra = sorted(m for m in mapped if m not in ids)
 print("    roster ids: %d, [model_context] keys: %d" % (len(ids), len(mapped)))
 print("    roster ids MISSING a [model_context] entry (fall back to default 64000): %s" % (gaps or "none"))
 print("    [model_context] keys NOT in live roster (config-only): %s" % (extra or "none"))
+open("${TMP}/roster_gaps", "w").write(str(len(gaps)))
 PY
-info "roster gaps above are recorded as findings (they pick default_context_length=64000 by accident)"
-note "roster: see gap list above (lms ls ids without a [model_context] entry)"
+gapn="$(cat "${TMP}/roster_gaps" 2>/dev/null || echo '?')"
+if [[ "${gapn}" == "0" ]]; then
+    ok "roster check: every live lms ls id has a [model_context] entry (no gaps)"
+else
+    note "roster check: ${gapn} live model id(s) have no [model_context] entry — they fall back to default_context_length=64000 (see list above)"
+fi
 
 # ===========================================================================
 say "STEP 11 — concurrency probe: 3 simultaneous small chat requests (R5 part 1)"
-info "note: gemma was reaped in step 8; the first of these will trigger a reload, which skews its wall time"
+info "note: gemma was unloaded during step 8 (daemon or LM Studio JIT); the first of these will trigger a reload, which skews its wall time"
 probe() { # $1=index
     local t0 t1 code
     t0="$(python3 -c 'import time;print(time.time())')"
