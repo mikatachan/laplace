@@ -23,11 +23,20 @@ class LMStudioAdapter:
         self,
         lms_cli: str | None = None,
         unload_verify_delay_s: float = 2.0,
+        load_timeout_s: float = 180.0,
+        footprint_overrides: dict[str, int] | None = None,
     ):
         self._explicit_cli = lms_cli
         self._lms_cli = self._expand_home(lms_cli or _DEFAULT_LMS_CLI)
         self._unload_verify_delay_s = unload_verify_delay_s
+        self._load_timeout_s = load_timeout_s
+        self._footprint_overrides = self._normalize_overrides(footprint_overrides)
         self._footprint_cache: dict[str, int | None] = {}
+
+    def _normalize_overrides(self, overrides: dict[str, int] | None) -> dict[str, int]:
+        if not overrides:
+            return {}
+        return {self.base_id(key): int(value) for key, value in overrides.items()}
 
     def base_id(self, model_id: str) -> str:
         if not model_id:
@@ -73,6 +82,9 @@ class LMStudioAdapter:
         return loaded
 
     async def footprint_mb(self, model_id: str) -> int | None:
+        override = self._footprint_overrides.get(self.base_id(model_id))
+        if override is not None:
+            return override
         if model_id in self._footprint_cache:
             return self._footprint_cache[model_id]
 
@@ -139,7 +151,7 @@ class LMStudioAdapter:
         try:
             rc, out, err = await self._run(
                 ["load", model_id, "--context-length", str(context_length), "-y"],
-                timeout=180.0,
+                timeout=self._load_timeout_s,
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("lmstudio: failed to load %s at ctx=%s: %s", model_id, context_length, exc)
