@@ -60,13 +60,19 @@ class UpstreamProxy:
         return await _relay(request, upstream_resp)
 
     async def probe_models(self, timeout: float = 5.0) -> bool:
-        """Return True when the upstream answers GET /v1/models with 200."""
+        """Return True when the upstream answers /v1/models with any HTTP status.
+
+        Any HTTP response (including 401/404) proves the upstream is reachable
+        and alive. LM Studio returns 401 to unauthenticated /v1/models probes,
+        and the daemon holds no secrets (D3), so demanding 200 would keep readyz
+        permanently not-ready. Only a connect error or timeout means not ready.
+        """
         try:
             async with self._session.get(
                 self._upstream + "/v1/models",
                 timeout=aiohttp.ClientTimeout(total=timeout),
-            ) as resp:
-                return resp.status == 200
+            ):
+                return True
         except Exception as exc:  # noqa: BLE001
             log.warning("proxy: /v1/models probe failed: %s", exc)
             return False

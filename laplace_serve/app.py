@@ -135,7 +135,7 @@ async def _readyz(request: web.Request) -> web.Response:
         return web.json_response({"status": "ready"})
     reasons = []
     if not models_ok:
-        reasons.append("upstream /v1/models not 200 within 5s")
+        reasons.append("upstream /v1/models unreachable within 5s")
     if not ps_ok:
         reasons.append("lms ps not rc 0 within 10s")
     return web.json_response(
