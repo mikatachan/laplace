@@ -68,7 +68,14 @@ def build_app(
 
 async def _on_startup(app: web.Application) -> None:
     config = app[CONFIG]
-    session = aiohttp.ClientSession(auto_decompress=False)
+    # total=None: the default aiohttp total=300s covers the ENTIRE streamed body
+    # read, so any proxied generation longer than 5 minutes would die mid-stream
+    # with a TimeoutError. Streams must be uncapped end to end; keep only a
+    # connect-phase bound (sock_connect) so a dead upstream still fails fast.
+    # probe_models passes its own explicit per-call timeout, and forward's 502
+    # path still catches connect-phase timeouts.
+    timeout = aiohttp.ClientTimeout(total=None, sock_connect=30)
+    session = aiohttp.ClientSession(auto_decompress=False, timeout=timeout)
     app[SESSION] = session
     app[PROXY] = UpstreamProxy(session, config.upstream)
     if config.reaper_sweep:

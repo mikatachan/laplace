@@ -99,9 +99,12 @@ async def _relay(
         # rather than draining it (R7), then re-raise to unwind the handler.
         upstream_resp.close()
         raise
-    except aiohttp.ClientError as exc:
-        # Upstream died mid-stream. Close downstream with no synthesized [DONE]
-        # (edge b); the truncated stream is the honest signal.
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        # Upstream died mid-stream, or a read/socket timeout fired. Close
+        # downstream with no synthesized [DONE] (edge b); the truncated stream is
+        # the honest signal. The session builds with total=None so a timeout here
+        # should not happen, but handling it keeps any future timeout graceful
+        # rather than an unhandled TimeoutError unwinding the handler.
         log.warning("proxy: upstream stream error: %s", exc)
         upstream_resp.close()
         return response

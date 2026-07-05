@@ -347,6 +347,22 @@ async def test_upstream_connect_failure_returns_502():
 
 
 @pytest.mark.asyncio
+async def test_upstream_session_has_no_total_timeout_ceiling():
+    # Regression pin (plan-0017 gate FINDING 1): the aiohttp default of
+    # total=300s covers the ENTIRE streamed body read, killing any proxied
+    # generation longer than 5 minutes mid-stream. The startup session must
+    # build with total=None (uncapped stream) and only a connect-phase bound.
+    # A real >300s stream test is impractical, so pin the construction.
+    from laplace_serve.app import SESSION
+
+    upstream = web.Application()
+    async with make_harness(upstream_app=upstream, upstream_state=UpstreamState()) as h:
+        session = h.client.app[SESSION]
+        assert session.timeout.total is None  # no 5-minute stream ceiling
+        assert session.timeout.sock_connect == 30  # connect phase still fails fast
+
+
+@pytest.mark.asyncio
 async def test_healthz_is_cheap_and_ok():
     upstream = web.Application()
     async with make_harness(upstream_app=upstream, upstream_state=UpstreamState()) as h:
