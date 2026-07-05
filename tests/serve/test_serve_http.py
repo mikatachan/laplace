@@ -375,9 +375,11 @@ async def test_readyz_ready_when_models_and_ps_ok():
 
 
 @pytest.mark.asyncio
-async def test_readyz_not_ready_when_models_fail():
+async def test_readyz_ready_when_upstream_returns_401():
+    # LM Studio answers unauthenticated /v1/models probes with 401. Any HTTP
+    # status proves the upstream is reachable and alive, so readyz is ready.
     async def models(request):
-        return web.json_response({"error": "down"}, status=500)
+        return web.json_response({"error": "unauthorized"}, status=401)
 
     upstream = web.Application()
     upstream.router.add_get("/v1/models", models)
@@ -389,8 +391,32 @@ async def test_readyz_not_ready_when_models_fail():
         upstream_app=upstream, upstream_state=UpstreamState(), readyz_ps_check=ps_ok
     ) as h:
         resp = await h.client.get("/readyz")
+        assert resp.status == 200
+        assert (await resp.json())["status"] == "ready"
+
+
+@pytest.mark.asyncio
+async def test_readyz_not_ready_when_upstream_unreachable():
+    # A connect error/timeout (nothing listening) is the only upstream failure
+    # that keeps readyz not-ready.
+    async def models(request):
+        return web.json_response({})
+
+    upstream = web.Application()
+    upstream.router.add_get("/v1/models", models)
+
+    async def ps_ok():
+        return True
+
+    async with make_harness(
+        upstream_app=upstream,
+        upstream_state=UpstreamState(),
+        readyz_ps_check=ps_ok,
+        upstream="http://127.0.0.1:1",
+    ) as h:
+        resp = await h.client.get("/readyz")
         assert resp.status == 503
-        assert "models" in (await resp.json())["reason"]
+        assert "upstream" in (await resp.json())["reason"]
 
 
 @pytest.mark.asyncio

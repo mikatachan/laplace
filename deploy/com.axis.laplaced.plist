@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.axis.laplaced</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/axis/github/laplace/.venv/bin/python</string>
+        <string>-m</string>
+        <string>laplace_serve</string>
+        <string>--config</string>
+        <string>/Users/axis/.laplace/laplaced.toml</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/axis/github/laplace</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/axis/github/laplace/.venv/bin:/Users/axis/.lmstudio/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/Users/axis</string>
+        <key>VIRTUAL_ENV</key>
+        <string>/Users/axis/github/laplace/.venv</string>
+    </dict>
+
+    <key>LimitLoadToSessionType</key>
+    <array>
+        <string>Aqua</string>
+        <string>Background</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/axis/.laplace/logs/launchd.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/axis/.laplace/logs/launchd.err</string>
+</dict>
+</plist>
