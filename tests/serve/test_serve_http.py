@@ -8,6 +8,7 @@ import aiohttp
 import pytest
 from aiohttp import web
 
+from laplace.adapter import ModelLoadError
 from laplace.broker import ContentionBroker
 from laplace.reaper import Reaper
 from laplace_serve.config import LaplacedConfig
@@ -16,6 +17,11 @@ from tests.serve.harness import UpstreamState, make_harness
 
 _GIB = 1024 ** 3
 _SSE_CHUNKS = [b'data: {"i": %d}\n\n' % i for i in range(8)] + [b"data: [DONE]\n\n"]
+
+
+class _ModelLoadErrorAdapter(FakeAdapter):
+    async def ensure_loaded(self, model_id: str, context_length: int | None) -> None:
+        raise ModelLoadError("simulated model load failure")
 
 
 def _json_body(**payload) -> bytes:
@@ -242,6 +248,33 @@ async def test_edge_a_upstream_non_200_relayed_as_is():
         )
         assert resp.status == 429
         assert (await resp.json())["error"] == "rate limited"
+
+
+@pytest.mark.asyncio
+async def test_model_load_failure_returns_503_without_upstream_proxy():
+    state = UpstreamState()
+
+    async def chat(request):
+        _record(state, request, await request.read())
+        return web.json_response({"ok": True})
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/chat/completions", chat)
+
+    async with make_harness(
+        upstream_app=upstream,
+        upstream_state=state,
+        adapter=_ModelLoadErrorAdapter(),
+    ) as h:
+        resp = await h.client.post(
+            "/hermes/v1/chat/completions",
+            data=_json_body(model="m"),
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status == 503
+        assert (await resp.json())["error"] == "model unavailable; load did not complete"
+
+    assert state.requests == []
 
 
 @pytest.mark.asyncio

@@ -11,7 +11,7 @@ from typing import Awaitable, Callable
 import aiohttp
 from aiohttp import web
 
-from laplace.adapter import InferenceAdapter
+from laplace.adapter import InferenceAdapter, ModelLoadError
 from laplace.broker import ContentionBroker
 from laplace.reaper import Reaper
 
@@ -97,31 +97,45 @@ async def _governed(request: web.Request) -> web.StreamResponse:
     model, stream = _extract_model_stream(body)
     ctx = config.model_context.get(model, config.default_context_length) if model else None
 
-    async with govern(
-        request.app[BROKER],
-        request.app[REAPER],
-        request.app[ADAPTER],
-        model=model,
-        ctx=ctx,
-        tier=tier,
-        fail_open=config.fail_open,
-    ) as admission:
-        log.info(
-            "admission origin=%s tier=%s model=%s decision=%s wait_ms=%s stream=%s",
+    try:
+        async with govern(
+            request.app[BROKER],
+            request.app[REAPER],
+            request.app[ADAPTER],
+            model=model,
+            ctx=ctx,
+            tier=tier,
+            fail_open=config.fail_open,
+        ) as admission:
+            log.info(
+                "admission origin=%s tier=%s model=%s decision=%s wait_ms=%s stream=%s",
+                origin,
+                tier,
+                model or "-",
+                admission.decision,
+                admission.wait_ms,
+                stream,
+            )
+            if not admission.proxy:
+                return web.json_response(
+                    {"error": "inference pool at capacity, retry later"},
+                    status=503,
+                    headers={"Retry-After": "30"},
+                )
+            return await request.app[PROXY].forward(request, _upstream_path(request), body)
+    except ModelLoadError as exc:
+        log.warning(
+            "admission origin=%s tier=%s model=%s decision=load-failed detail=%s",
             origin,
             tier,
             model or "-",
-            admission.decision,
-            admission.wait_ms,
-            stream,
+            str(exc)[:200],
         )
-        if not admission.proxy:
-            return web.json_response(
-                {"error": "inference pool at capacity, retry later"},
-                status=503,
-                headers={"Retry-After": "30"},
-            )
-        return await request.app[PROXY].forward(request, _upstream_path(request), body)
+        return web.json_response(
+            {"error": "model unavailable; load did not complete"},
+            status=503,
+            headers={"Retry-After": "5"},
+        )
 
 
 async def _ungoverned(request: web.Request) -> web.StreamResponse:

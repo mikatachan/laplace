@@ -6,6 +6,10 @@ from dataclasses import dataclass
 from typing import Protocol
 
 
+class ModelLoadError(RuntimeError):
+    """The runtime could not make the requested model ready for inference."""
+
+
 @dataclass
 class LoadedModel:
     """A loaded model instance reported by an inference runtime.

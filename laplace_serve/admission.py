@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import AsyncIterator
 
-from laplace.adapter import InferenceAdapter
+from laplace.adapter import InferenceAdapter, ModelLoadError
 from laplace.broker import ContentionBroker
 from laplace.reaper import Reaper
 
@@ -92,7 +92,7 @@ async def govern(
         if first_touch and not acquired and reaper.in_flight(model) == 0:
             reaper.unmark_managed(model)
         await broker.done(model)
-        if fail_open and isinstance(exc, Exception):
+        if fail_open and isinstance(exc, Exception) and not isinstance(exc, ModelLoadError):
             log.warning("admission: load/acquire error, forwarding ungoverned: %s", exc)
             yield Admission("fail-open", waited())
             return

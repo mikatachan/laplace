@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from laplace.adapter import ModelLoadError
 from laplace.adapters.lmstudio import LMStudioAdapter
 
 
@@ -69,3 +70,34 @@ async def test_load_timeout_defaults_to_180():
     adapter._run = fake_run
     await adapter.ensure_loaded("some/model", 4096)
     assert seen["timeout"] == 180.0
+
+
+@pytest.mark.asyncio
+async def test_ensure_loaded_raises_when_load_command_fails():
+    adapter = LMStudioAdapter()
+
+    async def fake_run(args, timeout):
+        if args[:2] == ["ps", "--json"]:
+            return (0, "[]", "")
+        return (1, "", "load failed")
+
+    adapter._run = fake_run
+    with pytest.raises(ModelLoadError, match="load failed"):
+        await adapter.ensure_loaded("some/model", 4096)
+
+
+@pytest.mark.asyncio
+async def test_ensure_loaded_raises_when_model_never_appears(monkeypatch):
+    adapter = LMStudioAdapter(load_timeout_s=1.0)
+    calls = {"ps": 0}
+
+    async def fake_run(args, timeout):
+        if args[:2] == ["ps", "--json"]:
+            calls["ps"] += 1
+            return (0, "[]", "")
+        return (0, "", "")
+
+    adapter._run = fake_run
+    monkeypatch.setattr("laplace.adapters.lmstudio.time.monotonic", iter([0.0, 0.0, 11.0]).__next__)
+    with pytest.raises(ModelLoadError, match="did not become resident"):
+        await adapter.ensure_loaded("some/model", 4096)

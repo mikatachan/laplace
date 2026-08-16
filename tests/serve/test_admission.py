@@ -4,6 +4,7 @@ import asyncio
 
 import pytest
 
+from laplace.adapter import ModelLoadError
 from laplace.broker import ContentionBroker
 from laplace.reaper import Reaper
 from laplace_serve.admission import govern
@@ -16,6 +17,11 @@ _MODEL = "qwen3-next-80b-a3b-thinking"
 class _FailingLoadAdapter(FakeAdapter):
     async def ensure_loaded(self, model_id, context_length):
         raise RuntimeError("simulated load failure")
+
+
+class _ModelLoadErrorAdapter(FakeAdapter):
+    async def ensure_loaded(self, model_id, context_length):
+        raise ModelLoadError("simulated model load failure")
 
 
 class _ExplodingBroker:
@@ -125,6 +131,22 @@ async def test_ii_failed_load_on_managed_model_stays_managed():
         assert adm.decision == "fail-open"
 
     assert reaper.is_managed(_MODEL) is True
+    assert broker._active_calls() == 0
+
+
+@pytest.mark.asyncio
+async def test_model_load_error_does_not_fail_open_when_flag_on():
+    adapter = _resident_adapter(_ModelLoadErrorAdapter)
+    reaper = Reaper(adapter)
+    broker = ContentionBroker(adapter, reaper, budget_mb=90000)
+
+    with pytest.raises(ModelLoadError):
+        async with govern(
+            broker, reaper, adapter,
+            model=_MODEL, ctx=131072, tier="interactive", fail_open=True,
+        ):
+            pass
+
     assert broker._active_calls() == 0
 
 

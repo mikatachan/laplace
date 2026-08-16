@@ -6,8 +6,9 @@ import asyncio
 import json
 import logging
 import os
+import time
 
-from laplace.adapter import LoadedModel
+from laplace.adapter import LoadedModel, ModelLoadError
 
 log = logging.getLogger(__name__)
 
@@ -141,29 +142,25 @@ class LMStudioAdapter:
     async def ensure_loaded(self, model_id: str, context_length: int | None) -> None:
         if not model_id or not context_length or context_length <= 0:
             return
-        current = None
-        for entry in await self.list_loaded():
-            if self.base_id(entry.id) == self.base_id(model_id):
-                current = entry.context_length
-                if current is not None and current >= context_length:
-                    return
-                break
+        current = await self._loaded_context(model_id)
+        if current is not None and current >= context_length:
+            return
         try:
             rc, out, err = await self._run(
                 ["load", model_id, "--context-length", str(context_length), "-y"],
                 timeout=self._load_timeout_s,
             )
         except Exception as exc:  # noqa: BLE001
-            log.warning("lmstudio: failed to load %s at ctx=%s: %s", model_id, context_length, exc)
-            return
+            raise ModelLoadError(
+                f"lmstudio failed to load {model_id} at ctx={context_length}: {exc}"
+            ) from exc
         if rc != 0:
-            log.warning(
-                "lmstudio: 'lms load %s --context-length %s -y' failed (rc=%s): %s",
-                model_id,
-                context_length,
-                rc,
-                (err or out).strip()[:200],
+            detail = (err or out).strip()[:200]
+            raise ModelLoadError(
+                f"lmstudio load failed for {model_id} at ctx={context_length} "
+                f"(rc={rc}): {detail}"
             )
+        await self._wait_until_loaded(model_id, context_length)
 
     async def force_unload(self, model_id: str) -> bool:
         if not model_id:
@@ -228,6 +225,25 @@ class LMStudioAdapter:
         if last_error is not None:
             raise last_error
         raise FileNotFoundError(self._lms_cli)
+
+    async def _loaded_context(self, model_id: str) -> int | None:
+        for entry in await self.list_loaded():
+            if self.base_id(entry.id) == self.base_id(model_id):
+                return entry.context_length
+        return None
+
+    async def _wait_until_loaded(self, model_id: str, context_length: int) -> None:
+        deadline = time.monotonic() + min(10.0, self._load_timeout_s)
+        while True:
+            current = await self._loaded_context(model_id)
+            if current is not None and current >= context_length:
+                return
+            if time.monotonic() >= deadline:
+                raise ModelLoadError(
+                    f"lmstudio load for {model_id} did not become resident at "
+                    f"ctx={context_length} after a successful load command"
+                )
+            await asyncio.sleep(0.1)
 
     @staticmethod
     def _entry_identifier(entry: dict) -> str:
