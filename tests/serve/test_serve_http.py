@@ -83,6 +83,36 @@ async def test_admission_gating_end_to_end(caplog):
 
 
 @pytest.mark.asyncio
+async def test_bare_model_id_uses_canonical_identity_for_admission():
+    state = UpstreamState()
+
+    async def chat(request):
+        body = await request.read()
+        _record(state, request, body)
+        return web.json_response({"ok": True})
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/chat/completions", chat)
+    canonical = "qwen/qwen3-coder-30b"
+    config = LaplacedConfig(
+        reaper_sweep=False,
+        model_context={canonical: 131072},
+        model_footprint_mb={canonical: 22000},
+    )
+
+    async with make_harness(upstream_app=upstream, upstream_state=state, config=config) as h:
+        response = await h.client.post(
+            "/hermes/v1/chat/completions",
+            data=_json_body(model="qwen3-coder-30b"),
+            headers={"Content-Type": "application/json"},
+        )
+        assert response.status == 200
+
+    assert h.adapter.ensure_loaded_calls == [(canonical, 131072)]
+    assert state.requests[0]["body"] == _json_body(model="qwen3-coder-30b")
+
+
+@pytest.mark.asyncio
 async def test_bare_v1_post_governed_as_default_origin(caplog):
     state = UpstreamState()
 

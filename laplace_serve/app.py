@@ -94,7 +94,8 @@ async def _governed(request: web.Request) -> web.StreamResponse:
     origin, tier = origins.resolve(request.match_info.get("origin"), request.headers, config)
 
     body = await request.read()
-    model, stream = _extract_model_stream(body)
+    requested_model, stream = _extract_model_stream(body)
+    model = config.canonical_model_id(requested_model)
     ctx = config.model_context.get(model, config.default_context_length) if model else None
 
     try:

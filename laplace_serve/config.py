@@ -62,6 +62,23 @@ class LaplacedConfig:
     def tier_for(self, origin: str) -> str:
         return self.origins.get(origin) or self.origins.get(DEFAULT_ORIGIN) or "scheduled"
 
+    def canonical_model_id(self, model_id: str | None) -> str | None:
+        """Resolve an unambiguous bare request id to a configured LM Studio key.
+
+        LM Studio reports catalog and resident identities as canonical keys such
+        as ``qwen/qwen3-coder-30b`` while callers may send the bare trailing
+        segment.  Do not guess when more than one configured key shares that
+        segment: preserving the incoming id is safer than admitting a request
+        against the wrong model.
+        """
+        if not model_id:
+            return model_id
+        configured = set(self.model_context) | set(self.model_footprint_mb)
+        if model_id in configured:
+            return model_id
+        matches = [key for key in configured if key.rsplit("/", 1)[-1] == model_id]
+        return matches[0] if len(matches) == 1 else model_id
+
     @classmethod
     def from_dict(cls, data: Mapping | None) -> "LaplacedConfig":
         raw = dict(data or {})
