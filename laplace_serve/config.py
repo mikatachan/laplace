@@ -77,7 +77,20 @@ class LaplacedConfig:
         if model_id in configured:
             return model_id
         matches = [key for key in configured if key.rsplit("/", 1)[-1] == model_id]
-        return matches[0] if len(matches) == 1 else model_id
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            log.warning(
+                "laplaced config: ambiguous bare model id %r matches %s; using it unchanged",
+                model_id,
+                sorted(matches),
+            )
+        else:
+            log.warning(
+                "laplaced config: unconfigured model id %r; using default context and unchanged id",
+                model_id,
+            )
+        return model_id
 
     @classmethod
     def from_dict(cls, data: Mapping | None) -> "LaplacedConfig":

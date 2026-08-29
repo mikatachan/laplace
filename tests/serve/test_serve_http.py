@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 
 import aiohttp
 import pytest
@@ -451,6 +452,27 @@ async def test_readyz_ready_when_models_and_ps_ok():
         resp = await h.client.get("/readyz")
         assert resp.status == 200
         assert (await resp.json())["status"] == "ready"
+
+
+@pytest.mark.asyncio
+async def test_readyz_reports_stale_reaper_sweep():
+    async def models(request):
+        return web.json_response({"data": []})
+
+    async def ps_ok():
+        return True
+
+    upstream = web.Application()
+    upstream.router.add_get("/v1/models", models)
+    config = LaplacedConfig(reaper_sweep=True, sweep_interval_s=1.0)
+    async with make_harness(
+        upstream_app=upstream, config=config, readyz_ps_check=ps_ok
+    ) as h:
+        h.reaper._last_successful_sweep = time.monotonic() - 3.0
+        resp = await h.client.get("/readyz")
+        assert resp.status == 503
+        body = await resp.json()
+        assert body["reaper_sweep"] == "stale"
 
 
 @pytest.mark.asyncio

@@ -77,4 +77,4 @@ async def make_harness(
 def _with_upstream(config: LaplacedConfig, upstream: str) -> LaplacedConfig:
     from dataclasses import replace
 
-    return replace(config, upstream=upstream, reaper_sweep=False)
+    return replace(config, upstream=upstream)

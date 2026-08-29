@@ -150,18 +150,26 @@ async def _healthz(request: web.Request) -> web.Response:
 
 
 async def _readyz(request: web.Request) -> web.Response:
+    config = request.app[CONFIG]
     proxy = request.app[PROXY]
     models_ok = await proxy.probe_models(timeout=5.0)
     ps_ok = await request.app[READYZ_PS_CHECK]()
-    if models_ok and ps_ok:
-        return web.json_response({"status": "ready"})
+    sweep_state = (
+        request.app[REAPER].sweep_health(config.sweep_interval_s * 2)
+        if config.reaper_sweep
+        else "disabled"
+    )
+    if models_ok and ps_ok and sweep_state in {"healthy", "disabled"}:
+        return web.json_response({"status": "ready", "reaper_sweep": sweep_state})
     reasons = []
     if not models_ok:
         reasons.append("upstream /v1/models unreachable within 5s")
     if not ps_ok:
         reasons.append("lms ps not rc 0 within 10s")
+    if sweep_state not in {"healthy", "disabled"}:
+        reasons.append(f"reaper sweep {sweep_state}")
     return web.json_response(
-        {"status": "not ready", "reason": "; ".join(reasons)},
+        {"status": "not ready", "reason": "; ".join(reasons), "reaper_sweep": sweep_state},
         status=503,
     )
 
