@@ -96,6 +96,7 @@ async def _governed(request: web.Request) -> web.StreamResponse:
     body = await request.read()
     requested_model, stream = _extract_model_stream(body)
     model = config.canonical_model_id(requested_model)
+    forwarded_body = _canonicalize_forwarded_model(body, requested_model, model)
     ctx = config.model_context.get(model, config.default_context_length) if model else None
 
     try:
@@ -123,7 +124,7 @@ async def _governed(request: web.Request) -> web.StreamResponse:
                     status=503,
                     headers={"Retry-After": "30"},
                 )
-            return await request.app[PROXY].forward(request, _upstream_path(request), body)
+            return await request.app[PROXY].forward(request, _upstream_path(request), forwarded_body)
     except ModelLoadError as exc:
         log.warning(
             "admission origin=%s tier=%s model=%s decision=load-failed detail=%s",
@@ -194,6 +195,27 @@ def _extract_model_stream(body: bytes) -> tuple[str | None, bool]:
     model = payload.get("model")
     model = model if isinstance(model, str) and model else None
     return model, bool(payload.get("stream"))
+
+
+def _canonicalize_forwarded_model(
+    body: bytes, requested_model: str | None, canonical_model: str | None
+) -> bytes:
+    """Replace a normalized request model without altering no-op bodies.
+
+    Admission uses canonical configured IDs.  When normalization changed the
+    caller's bare ID, the upstream must receive that same configured key rather
+    than relying on LM Studio to resolve the bare spelling independently.
+    """
+    if not requested_model or requested_model == canonical_model:
+        return body
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return body
+    if not isinstance(payload, dict) or payload.get("model") != requested_model:
+        return body
+    payload["model"] = canonical_model
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
 
 
 async def _lms_ps_ok(timeout: float) -> bool:
