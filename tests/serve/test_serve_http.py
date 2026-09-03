@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 
 import aiohttp
 import pytest
@@ -34,6 +35,7 @@ def _record(state: UpstreamState, request: web.Request, body: bytes) -> None:
             "path": request.path,
             "method": request.method,
             "authorization": request.headers.get("Authorization"),
+            "content_length": request.headers.get("Content-Length"),
             "body": body,
         }
     )
@@ -83,6 +85,69 @@ async def test_admission_gating_end_to_end(caplog):
 
 
 @pytest.mark.asyncio
+async def test_bare_model_id_is_canonical_for_admission_and_upstream():
+    state = UpstreamState()
+
+    async def chat(request):
+        body = await request.read()
+        _record(state, request, body)
+        return web.json_response({"ok": True})
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/chat/completions", chat)
+    canonical = "qwen/qwen3-coder-30b"
+    config = LaplacedConfig(
+        reaper_sweep=False,
+        model_context={canonical: 131072},
+        model_footprint_mb={canonical: 22000},
+    )
+
+    async with make_harness(upstream_app=upstream, upstream_state=state, config=config) as h:
+        response = await h.client.post(
+            "/hermes/v1/chat/completions",
+            data=b'{ "model" : "qwen3-coder-30b", "messages" : [{"role":"user","content":"hi"}], "extra" : {"model":"unchanged"} }',
+            headers={"Content-Type": "application/json"},
+        )
+        assert response.status == 200
+
+    assert h.adapter.ensure_loaded_calls == [(canonical, 131072)]
+    forwarded = json.loads(state.requests[0]["body"])
+    assert forwarded == {
+        "model": canonical,
+        "messages": [{"role": "user", "content": "hi"}],
+        "extra": {"model": "unchanged"},
+    }
+    assert state.requests[0]["content_length"] == str(len(state.requests[0]["body"]))
+
+
+@pytest.mark.asyncio
+async def test_unchanged_or_unparseable_model_bodies_pass_through_verbatim():
+    state = UpstreamState()
+
+    async def chat(request):
+        body = await request.read()
+        _record(state, request, body)
+        return web.json_response({"ok": True})
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/chat/completions", chat)
+    config = LaplacedConfig(reaper_sweep=False)
+    unconfigured = b'{ "model" : "not-configured", "preserve" : [ 1, 2 ] }'
+    malformed = b'{"model":"not-configured"'
+
+    async with make_harness(upstream_app=upstream, upstream_state=state, config=config) as h:
+        for body in (unconfigured, malformed):
+            response = await h.client.post(
+                "/hermes/v1/chat/completions",
+                data=body,
+                headers={"Content-Type": "application/json"},
+            )
+            assert response.status == 200
+
+    assert [request["body"] for request in state.requests] == [unconfigured, malformed]
+
+
+@pytest.mark.asyncio
 async def test_bare_v1_post_governed_as_default_origin(caplog):
     state = UpstreamState()
 
@@ -110,10 +175,16 @@ async def test_streaming_byte_fidelity_and_incremental():
     state = UpstreamState()
     upstream = _sse_upstream(state, "/v1/chat/completions")
 
-    async with make_harness(upstream_app=upstream, upstream_state=state) as h:
+    canonical = "qwen/qwen3-coder-30b"
+    config = LaplacedConfig(
+        reaper_sweep=False,
+        model_context={canonical: 131072},
+        model_footprint_mb={canonical: 22000},
+    )
+    async with make_harness(upstream_app=upstream, upstream_state=state, config=config) as h:
         resp = await h.client.post(
             "/hermes/v1/chat/completions",
-            data=_json_body(model="m", stream=True),
+            data=_json_body(model="qwen3-coder-30b", stream=True),
             headers={"Content-Type": "application/json"},
         )
         assert resp.status == 200
@@ -126,6 +197,7 @@ async def test_streaming_byte_fidelity_and_incremental():
 
     assert b"".join(pieces) == b"".join(_SSE_CHUNKS)  # byte identical
     assert len(pieces) >= 2  # relayed incrementally, not aggregated
+    assert json.loads(state.requests[0]["body"])["model"] == canonical
 
 
 @pytest.mark.asyncio
@@ -421,6 +493,27 @@ async def test_readyz_ready_when_models_and_ps_ok():
         resp = await h.client.get("/readyz")
         assert resp.status == 200
         assert (await resp.json())["status"] == "ready"
+
+
+@pytest.mark.asyncio
+async def test_readyz_reports_stale_reaper_sweep():
+    async def models(request):
+        return web.json_response({"data": []})
+
+    async def ps_ok():
+        return True
+
+    upstream = web.Application()
+    upstream.router.add_get("/v1/models", models)
+    config = LaplacedConfig(reaper_sweep=True, sweep_interval_s=1.0)
+    async with make_harness(
+        upstream_app=upstream, config=config, readyz_ps_check=ps_ok
+    ) as h:
+        h.reaper._last_successful_sweep = time.monotonic() - 3.0
+        resp = await h.client.get("/readyz")
+        assert resp.status == 503
+        body = await resp.json()
+        assert body["reaper_sweep"] == "stale"
 
 
 @pytest.mark.asyncio

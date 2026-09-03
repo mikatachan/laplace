@@ -332,6 +332,20 @@ def test_unmark_managed_works_when_not_in_flight():
     assert reaper.is_managed(model) is False
 
 
+def test_sweep_health_reports_starting_healthy_and_stale():
+    class ActiveTask:
+        def done(self):
+            return False
+
+    reaper, _adapter = _reaper()
+    reaper._sweep_task = ActiveTask()
+    assert reaper.sweep_health(60.0) == "starting"
+    reaper._last_successful_sweep = time.monotonic()
+    assert reaper.sweep_health(60.0) == "healthy"
+    reaper._last_successful_sweep = time.monotonic() - 61.0
+    assert reaper.sweep_health(60.0) == "stale"
+
+
 @pytest.mark.asyncio
 async def test_run_sweep_loop_survives_exception_and_stops(monkeypatch: pytest.MonkeyPatch):
     reaper, _adapter = _reaper()

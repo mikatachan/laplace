@@ -63,6 +63,38 @@ def test_missing_context_ids_lists_gaps():
     assert missing_context_ids(["a", "b"], config) == []
 
 
+def test_canonical_model_id_resolves_unambiguous_bare_id():
+    config = LaplacedConfig.from_dict(
+        {"model_context": {"qwen/qwen3-coder-30b": 131072}}
+    )
+
+    assert config.canonical_model_id("qwen3-coder-30b") == "qwen/qwen3-coder-30b"
+
+
+def test_canonical_model_id_preserves_ambiguous_bare_id():
+    config = LaplacedConfig.from_dict(
+        {"model_context": {"org-a/model": 4096, "org-b/model": 8192}}
+    )
+
+    assert config.canonical_model_id("model") == "model"
+
+
+def test_canonical_model_id_warns_for_unconfigured_bare_id(caplog):
+    config = LaplacedConfig.from_dict({"model_context": {"qwen/configured": 8192}})
+
+    assert config.canonical_model_id("qwen3.6-27b-mlx") == "qwen3.6-27b-mlx"
+    assert "unconfigured model id 'qwen3.6-27b-mlx'" in caplog.text
+
+
+def test_canonical_model_id_warns_for_ambiguous_bare_id(caplog):
+    config = LaplacedConfig.from_dict(
+        {"model_context": {"a/model": 8192, "b/model": 16384}}
+    )
+
+    assert config.canonical_model_id("model") == "model"
+    assert "ambiguous bare model id 'model'" in caplog.text
+
+
 @pytest.mark.asyncio
 async def test_footprint_overrides_plumb_to_adapter(monkeypatch):
     config = LaplacedConfig.from_dict(
