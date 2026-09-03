@@ -38,6 +38,7 @@ class Reaper:
         self._loaded_size_bytes: dict[str, int] = {}
         self._reap_tasks: set[asyncio.Task] = set()
         self._sweep_task: asyncio.Task | None = None
+        self._last_successful_sweep: float | None = None
         self._broker = None
         self._ext_idle_sweeps: dict[str, int] = {}
         self._ext_last_used_seen: dict[str, float] = {}
@@ -346,6 +347,17 @@ class Reaper:
 
         if unloaded_count and self._broker is not None:
             await self._broker.notify_freed(freed_mb)
+        self._last_successful_sweep = time.monotonic()
+
+    def sweep_health(self, max_age_s: float) -> str:
+        """Return the current autonomous-sweep state for readiness checks."""
+        if self._sweep_task is None or self._sweep_task.done():
+            return "stopped"
+        if self._last_successful_sweep is None:
+            return "starting"
+        if time.monotonic() - self._last_successful_sweep > max_age_s:
+            return "stale"
+        return "healthy"
 
     async def request_free(self, needed_mb: int, priority=None) -> bool:
         if needed_mb <= 0:
