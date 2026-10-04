@@ -1,11 +1,13 @@
 """Recovery regressions; stateful fake CLI only, no daemon or live config."""
 import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from laplace.adapter import ModelLoadError
 from laplace.adapters.lmstudio import LMStudioAdapter
+from laplace.adapters import lmstudio
 
 A, B = 'catalog/a', 'catalog/b'
 
@@ -96,12 +98,18 @@ async def test_resident_admits_within_bound_while_other_load_in_progress():
 
 
 @pytest.mark.asyncio
-async def test_definite_failure_without_new_instance_can_retry():
+async def test_definite_failure_without_new_instance_can_retry(monkeypatch):
+    clock = SimpleNamespace(now=100.0)
+    monkeypatch.setattr(lmstudio, 'time', SimpleNamespace(monotonic=lambda: clock.now))
     rt = Runtime()
     rt.fail_load = True
     with pytest.raises(ModelLoadError):
         await rt.adapter.ensure_loaded(A, 4096)
     rt.fail_load = False
+    with pytest.raises(ModelLoadError, match='unresolved'):
+        await rt.adapter.ensure_loaded(A, 4096)
+    assert rt.loads == [A]
+    clock.now = 190
     await rt.adapter.ensure_loaded(A, 4096)
     assert rt.loads == [A, A]
 
@@ -117,12 +125,20 @@ async def test_uncertain_model_does_not_block_unrelated_cold_load():
 
 
 @pytest.mark.asyncio
-async def test_failed_command_with_flaky_inventory_recovers_when_absent():
+async def test_failed_command_with_flaky_inventory_recovers_when_absent(monkeypatch):
+    clock = SimpleNamespace(now=100.0)
+    monkeypatch.setattr(lmstudio, 'time', SimpleNamespace(monotonic=lambda: clock.now))
     rt = Runtime()
     rt.fail_load = rt.flaky_ps = True
     with pytest.raises(ModelLoadError):
         await rt.adapter.ensure_loaded(A, 4096)
     rt.fail_load = False
+    with pytest.raises(ModelLoadError, match='cannot establish residency'):
+        await rt.adapter.ensure_loaded(A, 4096)
+    with pytest.raises(ModelLoadError, match='unresolved'):
+        await rt.adapter.ensure_loaded(A, 4096)
+    assert rt.loads == [A]
+    clock.now = 190
     await rt.adapter.ensure_loaded(A, 4096)
     assert rt.loads == [A, A]
 

@@ -107,3 +107,10 @@ async def test_footprint_overrides_plumb_to_adapter(monkeypatch):
 
     monkeypatch.setattr(adapter, "_run", _boom)
     assert await adapter.footprint_mb("qwen3-next-80b-a3b-thinking") == 48000
+
+
+def test_load_grace_default_and_override_reach_adapter():
+    default, _, _ = build_components(LaplacedConfig.from_dict({}))
+    assert default._load_grace_s == 90
+    custom, _, _ = build_components(LaplacedConfig.from_dict({"load_grace_s": 17}))
+    assert custom._load_grace_s == 17

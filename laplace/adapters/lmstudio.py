@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import time
+from dataclasses import dataclass
 
 from laplace.adapter import LoadedModel, ModelLoadError
 
@@ -16,6 +17,13 @@ log = logging.getLogger(__name__)
 _MIB = 1024 * 1024
 _DEFAULT_LMS_CLI = "~/.lmstudio/bin/lms"
 _FOOTPRINT_OVERHEAD = 1.3
+
+
+@dataclass
+class _UncertainLoad:
+    previous: set[str]
+    started_at: float
+    catalog_keys: set[str]
 
 
 class LMStudioAdapter:
@@ -27,19 +35,21 @@ class LMStudioAdapter:
         unload_verify_delay_s: float = 2.0,
         load_timeout_s: float = 180.0,
         footprint_overrides: dict[str, int] | None = None,
+        load_grace_s: float = 90.0,
     ):
         self._explicit_cli = lms_cli
         self._lms_cli = self._expand_home(lms_cli or _DEFAULT_LMS_CLI)
         self._unload_verify_delay_s = unload_verify_delay_s
         self._load_timeout_s = load_timeout_s
+        self._load_grace_s = load_grace_s
         self._footprint_overrides = self._normalize_overrides(footprint_overrides)
         self._footprint_cache: dict[str, int | None] = {}
         # Serialize mutations; resident admissions never wait for this lock.
         self._load_lock = asyncio.Lock()
         self._active_load: str | None = None
         self._load_failures: dict[str, str] = {}
-        # Per-model pre-load identifiers and whether the CLI definitely returned failure.
-        self._load_uncertain: dict[str, tuple[set[str], bool]] = {}
+        # Preserve the original deadline across retries and inventory failures.
+        self._load_uncertain: dict[str, _UncertainLoad] = {}
 
     def _normalize_overrides(self, overrides: dict[str, int] | None) -> dict[str, int]:
         if not overrides:
@@ -165,17 +175,7 @@ class LMStudioAdapter:
             failure = self._load_failures.get(base)
             if failure:
                 raise ModelLoadError(failure)
-            pending = self._load_uncertain.get(base)
-            if pending:
-                previous, command_failed = pending
-                current = {self._entry_identifier(entry) for entry in before}
-                if command_failed and not (current - previous):
-                    self._load_uncertain.pop(base)
-                else:
-                    raise ModelLoadError(
-                        f"lmstudio load outcome unresolved for requested {model_id}; "
-                        "this model needs a verified resident or operator reconciliation"
-                    )
+            self._reconcile_uncertain(before)
             keys = await self._catalog_keys()
             if model_id not in keys:
                 closest = difflib.get_close_matches(model_id, sorted(keys), n=1, cutoff=0)
@@ -187,7 +187,7 @@ class LMStudioAdapter:
                 raise ModelLoadError(message)
 
             previous = {self._entry_identifier(entry) for entry in before}
-            self._load_uncertain[base] = (previous, False)
+            self._load_uncertain[base] = _UncertainLoad(previous, time.monotonic(), keys)
             self._active_load = base
             try:
                 rc, out, err = await self._run(
@@ -195,20 +195,55 @@ class LMStudioAdapter:
                     timeout=self._load_timeout_s,
                 )
                 if rc != 0:
-                    self._load_uncertain[base] = (previous, True)
-                    after = await self._resident_entries()
-                    if not ({self._entry_identifier(entry) for entry in after} - previous):
-                        self._load_uncertain.pop(base)
                     raise ModelLoadError(
                         f"lmstudio load failed for {model_id} at ctx={context_length} "
                         f"(rc={rc}): {(err or out).strip()[:200]}"
                     )
                 await self._verify_load(model_id, context_length, before, keys)
+            except TimeoutError as exc:
+                message = (
+                    f"lms load timed out after {self._load_timeout_s:g}s "
+                    f"for {model_id} at ctx={context_length}"
+                )
+                log.error("%s", message)
+                raise ModelLoadError(message) from exc
             except Exception as exc:
                 log.error("%s", exc)
                 raise ModelLoadError(str(exc)) from exc
             finally:
                 self._active_load = None
+            self._clear_load_state(base)
+
+    def _reconcile_uncertain(self, entries: list[dict]) -> None:
+        """Use the fresh locked snapshot before permitting any cold load."""
+        for base, pending in list(self._load_uncertain.items()):
+            if any(self._matches(entry, base) for entry in entries):
+                # Visible instances are accounted for by the broker's inventory.
+                self._clear_load_state(base)
+                continue
+            deadline = pending.started_at + self._load_timeout_s + self._load_grace_s
+            if time.monotonic() < deadline:
+                raise ModelLoadError(
+                    f"lmstudio load outcome unresolved for requested {base}; "
+                    "cold loads blocked during timeout plus grace window"
+                )
+            # A known other catalog model is not evidence of a fuzzy result.
+            # Unknown new identities cannot safely be attributed or ignored.
+            possible = [
+                entry for entry in entries
+                if self._entry_identifier(entry) not in pending.previous
+                and not any(self._matches(entry, key) for key in pending.catalog_keys - {base})
+            ]
+            if possible:
+                raise ModelLoadError(
+                    f"lmstudio load outcome unresolved for requested {base}; "
+                    f"new unidentified instances={[self._entry_identifier(e) for e in possible]}; "
+                    "operator reconciliation required"
+                )
+            log.warning(
+                "lmstudio load outcome failed for %s after timeout plus grace; "
+                "fresh inventory has no new matching instance; allowing retry", base,
+            )
             self._clear_load_state(base)
 
     def _clear_load_state(self, base: str) -> None:
@@ -384,7 +419,15 @@ class LMStudioAdapter:
             except FileNotFoundError as exc:
                 last_error = exc
                 continue
-            out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            try:
+                out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            except (TimeoutError, asyncio.CancelledError):
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass  # The child may have exited between timeout and kill.
+                await proc.wait()
+                raise
             return proc.returncode, (out or b"").decode(), (err or b"").decode()
         if last_error is not None:
             raise last_error
