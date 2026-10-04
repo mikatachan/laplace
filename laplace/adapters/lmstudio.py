@@ -34,11 +34,12 @@ class LMStudioAdapter:
         self._load_timeout_s = load_timeout_s
         self._footprint_overrides = self._normalize_overrides(footprint_overrides)
         self._footprint_cache: dict[str, int | None] = {}
-        # Serialize snapshot/load/verification across models so our own loads
-        # cannot be mistaken for one another during mismatch cleanup.
+        # Serialize mutations; resident admissions never wait for this lock.
         self._load_lock = asyncio.Lock()
+        self._active_load: str | None = None
         self._load_failures: dict[str, str] = {}
-        self._load_uncertain: str | None = None
+        # Per-model pre-load identifiers and whether the CLI definitely returned failure.
+        self._load_uncertain: dict[str, tuple[set[str], bool]] = {}
 
     def _normalize_overrides(self, overrides: dict[str, int] | None) -> dict[str, int]:
         if not overrides:
@@ -148,22 +149,33 @@ class LMStudioAdapter:
     async def ensure_loaded(self, model_id: str, context_length: int | None) -> None:
         if not model_id or not context_length or context_length <= 0:
             return
+        base = self.base_id(model_id)
+        before = await self._resident_entries()
+        if self._admit_resident(before, model_id, context_length):
+            # Do not clear state belonging to a command still in progress.
+            if self._active_load != base:
+                self._clear_load_state(base)
+            return
         async with self._load_lock:
-            base = self.base_id(model_id)
-            failure = self._load_uncertain or self._load_failures.get(base)
+            # Another admission may have loaded it while we waited.
+            before = await self._resident_entries()
+            if self._admit_resident(before, model_id, context_length):
+                self._clear_load_state(base)
+                return
+            failure = self._load_failures.get(base)
             if failure:
                 raise ModelLoadError(failure)
-            before = await self._resident_entries()
-            matches = [entry for entry in before if self._matches(entry, model_id)]
-            if matches:
-                if len(matches) == 1 and (self._entry_context_length(matches[0]) or 0) >= context_length:
-                    return
-                raise ModelLoadError(
-                    f"lmstudio refusing duplicate load for {model_id}: already resident as "
-                    f"{[self._entry_identifier(entry) for entry in matches]} with "
-                    f"insufficient/unknown context or duplicate instances (wanted ctx={context_length})"
-                )
-
+            pending = self._load_uncertain.get(base)
+            if pending:
+                previous, command_failed = pending
+                current = {self._entry_identifier(entry) for entry in before}
+                if command_failed and not (current - previous):
+                    self._load_uncertain.pop(base)
+                else:
+                    raise ModelLoadError(
+                        f"lmstudio load outcome unresolved for requested {model_id}; "
+                        "this model needs a verified resident or operator reconciliation"
+                    )
             keys = await self._catalog_keys()
             if model_id not in keys:
                 closest = difflib.get_close_matches(model_id, sorted(keys), n=1, cutoff=0)
@@ -174,29 +186,46 @@ class LMStudioAdapter:
                 log.error("%s", message)
                 raise ModelLoadError(message)
 
-            # A cancelled/failed CLI can still have submitted a server-side load.
-            # Until residency is proven, prohibit any further load in this adapter.
-            self._load_uncertain = (
-                f"lmstudio load outcome unresolved for requested {model_id}; "
-                "further loads blocked until operator reconciliation and daemon restart"
-            )
+            previous = {self._entry_identifier(entry) for entry in before}
+            self._load_uncertain[base] = (previous, False)
+            self._active_load = base
             try:
                 rc, out, err = await self._run(
                     ["load", model_id, "--context-length", str(context_length), "-y"],
                     timeout=self._load_timeout_s,
                 )
                 if rc != 0:
+                    self._load_uncertain[base] = (previous, True)
+                    after = await self._resident_entries()
+                    if not ({self._entry_identifier(entry) for entry in after} - previous):
+                        self._load_uncertain.pop(base)
                     raise ModelLoadError(
                         f"lmstudio load failed for {model_id} at ctx={context_length} "
                         f"(rc={rc}): {(err or out).strip()[:200]}"
                     )
-                await self._verify_load(model_id, context_length, before)
+                await self._verify_load(model_id, context_length, before, keys)
             except Exception as exc:
-                message = f"{exc}; {self._load_uncertain}" if self._load_uncertain else str(exc)
-                self._load_failures[base] = message
-                log.error("%s", message)
-                raise ModelLoadError(message) from exc
-            self._load_uncertain = None
+                log.error("%s", exc)
+                raise ModelLoadError(str(exc)) from exc
+            finally:
+                self._active_load = None
+            self._clear_load_state(base)
+
+    def _clear_load_state(self, base: str) -> None:
+        self._load_uncertain.pop(base, None)
+        self._load_failures.pop(base, None)
+
+    def _admit_resident(self, entries: list[dict], model_id: str, context_length: int) -> bool:
+        matches = [entry for entry in entries if self._matches(entry, model_id)]
+        if not matches:
+            return False
+        if len(matches) == 1 and (self._entry_context_length(matches[0]) or 0) >= context_length:
+            return True
+        raise ModelLoadError(
+            f"lmstudio refusing duplicate load for {model_id}: already resident as "
+            f"{[self._entry_identifier(entry) for entry in matches]} with "
+            f"insufficient/unknown context or duplicate instances (wanted ctx={context_length})"
+        )
 
     async def _resident_entries(self) -> list[dict]:
         """Inventory used for mutations must fail closed, never mean 'empty'."""
@@ -224,27 +253,34 @@ class LMStudioAdapter:
             for key in ("identifier", "modelKey", "path")
         )
 
-    async def _verify_load(self, model_id: str, context_length: int, before: list[dict]) -> None:
+    async def _verify_load(
+        self, model_id: str, context_length: int, before: list[dict], keys: set[str]
+    ) -> None:
         previous = {self._entry_identifier(entry) for entry in before}
         deadline = time.monotonic() + min(10.0, self._load_timeout_s)
         while True:
             entries = await self._resident_entries()
             created = [entry for entry in entries if self._entry_identifier(entry) not in previous]
-            if len(created) == 1:
-                actual = self._entry_identifier(created[0])
-                if actual == model_id and (self._entry_context_length(created[0]) or 0) >= context_length:
-                    return
-                # Only one new instance can be attributed to this serialized load.
-                # Never unload pre-existing residents, even with matching keys.
-                if actual != model_id or time.monotonic() >= deadline:
-                    cleaned = await self.force_unload(actual)
-                    if cleaned:
-                        self._load_uncertain = None
-                    raise ModelLoadError(
-                        f"lmstudio requested {model_id} at ctx={context_length}, actually loaded "
-                        f"{actual} at ctx={self._entry_context_length(created[0])}; "
-                        f"cleanup unload {'verified' if cleaned else 'FAILED'}; automatic retry disabled"
-                    )
+            exact = [entry for entry in created if self._entry_identifier(entry) == model_id]
+            if exact and self._admit_resident(entries, model_id, context_length):
+                return
+            # Known catalog identities may be another client's concurrent load.
+            # Even an unknown identity is only a candidate, never proof of ownership.
+            candidates = [
+                entry for entry in created
+                if not any(self._matches(entry, key) for key in keys - {model_id})
+            ]
+            fuzzy = [entry for entry in candidates if self._entry_identifier(entry) != model_id]
+            if fuzzy:
+                message = (
+                    f"lmstudio requested {model_id}, observed possible fuzzy load "
+                    f"{[self._entry_identifier(entry) for entry in fuzzy]}; "
+                    "ownership unknown; no cleanup; automatic retry disabled until "
+                    "requested model is verified resident"
+                )
+                self._load_failures[self.base_id(model_id)] = message
+                self._load_uncertain.pop(self.base_id(model_id), None)
+                raise ModelLoadError(message)
             if time.monotonic() >= deadline:
                 raise ModelLoadError(
                     f"lmstudio load for {model_id} did not become resident at "
