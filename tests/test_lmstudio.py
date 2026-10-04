@@ -118,4 +118,4 @@ async def test_ensure_loaded_raises_when_model_never_appears():
     adapter._run = fake_run
     with pytest.raises(ModelLoadError, match="did not become resident"):
         await adapter.ensure_loaded("some/model", 4096)
-    assert calls["ps"] == 2
+    assert calls["ps"] == 3  # fast path, locked recheck, post-load verification

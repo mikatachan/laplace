@@ -57,7 +57,7 @@ class CLI:
 
 
 @pytest.mark.asyncio
-async def test_mismatch_cleans_actual_identifier_and_never_retries(caplog):
+async def test_mismatch_never_unloads_unowned_instance_or_retries(caplog):
     cli = CLI(actual=NEW + ":2")
     adapter = cli.adapter()
     for _ in range(3):
@@ -66,8 +66,8 @@ async def test_mismatch_cleans_actual_identifier_and_never_retries(caplog):
         assert OLD in str(caught.value)
         assert NEW + ":2" in str(caught.value)
     assert len(cli.loads) == 1
-    assert ["unload", NEW + ":2"] in cli.calls
-    assert cli.residents == []
+    assert not any(call[0] == "unload" for call in cli.calls)
+    assert cli.residents[0]["identifier"] == NEW + ":2"
     assert any(record.levelno == logging.ERROR and OLD in record.message and NEW in record.message for record in caplog.records)
 
 
@@ -141,15 +141,16 @@ async def test_inventory_failure_prevents_load():
 
 
 @pytest.mark.asyncio
-async def test_cleanup_failure_blocks_other_model_loads():
+async def test_fuzzy_failure_does_not_block_other_model_loads():
     cli = CLI(actual=NEW)
-    cli.unload_error = True
     adapter = cli.adapter()
-    with pytest.raises(ModelLoadError, match="cleanup unload FAILED"):
+    with pytest.raises(ModelLoadError, match="ownership unknown"):
         await adapter.ensure_loaded(OLD, 4096)
-    with pytest.raises(ModelLoadError, match="unresolved"):
-        await adapter.ensure_loaded("another-model", 4096)
-    assert len(cli.loads) == 1
+    cli.catalog.append("another-model")
+    cli.actual = "another-model"
+    await adapter.ensure_loaded("another-model", 4096)
+    assert len(cli.loads) == 2
+    assert not any(call[0] == "unload" for call in cli.calls)
 
 
 @pytest.mark.asyncio

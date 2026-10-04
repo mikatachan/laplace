@@ -96,18 +96,36 @@ See the assessment in `docs/`. Closest adjacent tools: **llama-swap** (own-proce
 ## License
 MIT.
 
-LM Studio loads are serialized within each adapter. Before loading, the adapter
-requires a successful residency snapshot and an exact `lms ls --json` model key;
-fuzzy catalog names are rejected. Existing instances (including `:N` identifiers
-and matching model keys/paths) prevent another load. Insufficient or unknown
-resident context fails admission instead of loading another copy.
+LM Studio load mutations are serialized within each adapter. A fresh read-only
+residency check runs before the lock and any failure guard: a single matching
+instance with sufficient context admits even while another model is loading.
+Cold loads require a second successful snapshot under the lock and an exact
+`lms ls --json` catalog key. Failed inventory reads never mean empty inventory.
+Existing instances (including `:N` identifiers and matching model keys/paths)
+prevent another load. Insufficient or missing context fails admission; it is
+rechecked on each request, not cached. Automatic context upgrades are not done:
+this adapter cannot prove an instance is idle for external clients, and has no
+atomic reservation-and-unload interface. An operator must reconcile that instance.
 
-A successful command that produces a different identifier fails admission and
-unloads the uniquely new instance by its actual identifier. That requested ID
-cannot automatically retry during this adapter's lifetime. An uncertain command
-outcome, ambiguous new instances, or unverified cleanup blocks further loads
-until an operator reconciles LM Studio state and restarts the daemon. This is a
-process-local guard: other LM Studio clients must coordinate their own loads;
-snapshot differences cannot prove ownership against concurrent external clients.
+Failures are per-model. A nonzero load exit followed by no new instances clears
+uncertainty and permits a later retry. A flaky verification read recovers on the
+next admission when the requested model is present. Exact successful loads also
+admit when another client concurrently loads a different catalog model.
+
+A possible fuzzy result disables retries for that requested ID until sufficient
+residency is verified. The failure record then clears; unrelated catalog changes
+do not permit retries. No snapshot difference proves ownership, so verification never unloads
+new instances automatically, including unknown identifiers. Known other catalog
+keys are excluded from fuzzy candidates. Operator cleanup may therefore be needed.
+
+Timeouts/cancellation or successful commands without a visible result remain
+uncertain for that model; each admission rechecks reality. A later verified
+resident clears the restriction. An empty snapshot cannot prove a server-side
+load is no longer pending, so safe automatic retry in that case is unavailable.
+After independently confirming the server operation has ended, an operator may
+reconcile residency and recreate the adapter. This limitation never blocks other
+models. This is a process-local guard; concurrent external loads of the SAME
+model require coordination beyond this adapter.
+
 Startup logs ERRORs for configured context/footprint keys absent from the catalog,
 including the closest key, but continues serving.
