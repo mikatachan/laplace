@@ -107,10 +107,19 @@ rechecked on each request, not cached. Automatic context upgrades are not done:
 this adapter cannot prove an instance is idle for external clients, and has no
 atomic reservation-and-unload interface. An operator must reconcile that instance.
 
-Failures are per-model. A nonzero load exit followed by no new instances clears
-uncertainty and permits a later retry. A flaky verification read recovers on the
-next admission when the requested model is present. Exact successful loads also
-admit when another client concurrently loads a different catalog model.
+A timed-out CLI is killed and reaped. Timeouts, cancellation, nonzero exits, and
+successful commands without a visible result retain the load's monotonic start
+time. Until `load_timeout_s + load_grace_s` has elapsed from that start, unresolved
+loads block cold loads of **any** model: pending server work is absent from the
+broker's resident-memory budget. Resident admissions still use the fast path.
+`load_grace_s` defaults to 90 seconds and is configurable on `LMStudioAdapter` and
+as a top-level `laplaced.toml` option.
+
+Each admission takes a fresh inventory. A matching resident reconciles uncertainty;
+after the deadline, no new matching or unidentified instance marks the attempt
+failed and permits retry. Failed inventory reads retain the restriction. Known
+other catalog models do not prevent recovery. A flaky verification read recovers
+when the requested model is present, including before the deadline.
 
 A possible fuzzy result disables retries for that requested ID until sufficient
 residency is verified. The failure record then clears; unrelated catalog changes
@@ -118,14 +127,13 @@ do not permit retries. No snapshot difference proves ownership, so verification 
 new instances automatically, including unknown identifiers. Known other catalog
 keys are excluded from fuzzy candidates. Operator cleanup may therefore be needed.
 
-Timeouts/cancellation or successful commands without a visible result remain
-uncertain for that model; each admission rechecks reality. A later verified
-resident clears the restriction. An empty snapshot cannot prove a server-side
-load is no longer pending, so safe automatic retry in that case is unavailable.
-After independently confirming the server operation has ended, an operator may
-reconcile residency and recreate the adapter. This limitation never blocks other
-models. This is a process-local guard; concurrent external loads of the SAME
-model require coordination beyond this adapter.
+Bounded retry assumes server work becomes visible or stops within the configured
+window. Killing `lms` does not establish cancellation of server-side work, and an
+empty `ps` cannot prove that no server load is pending. The grace window is an
+operational bound, not a server cancellation guarantee; choose it accordingly.
+An unidentified new instance remains blocked for operator reconciliation even
+after the deadline. This is a process-local guard; concurrent external loads of
+the SAME model require coordination beyond this adapter.
 
 Startup logs ERRORs for configured context/footprint keys absent from the catalog,
 including the closest key, but continues serving.
