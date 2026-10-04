@@ -95,3 +95,19 @@ See the assessment in `docs/`. Closest adjacent tools: **llama-swap** (own-proce
 
 ## License
 MIT.
+
+LM Studio loads are serialized within each adapter. Before loading, the adapter
+requires a successful residency snapshot and an exact `lms ls --json` model key;
+fuzzy catalog names are rejected. Existing instances (including `:N` identifiers
+and matching model keys/paths) prevent another load. Insufficient or unknown
+resident context fails admission instead of loading another copy.
+
+A successful command that produces a different identifier fails admission and
+unloads the uniquely new instance by its actual identifier. That requested ID
+cannot automatically retry during this adapter's lifetime. An uncertain command
+outcome, ambiguous new instances, or unverified cleanup blocks further loads
+until an operator reconciles LM Studio state and restarts the daemon. This is a
+process-local guard: other LM Studio clients must coordinate their own loads;
+snapshot differences cannot prove ownership against concurrent external clients.
+Startup logs ERRORs for configured context/footprint keys absent from the catalog,
+including the closest key, but continues serving.
