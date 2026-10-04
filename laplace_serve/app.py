@@ -12,6 +12,7 @@ import aiohttp
 from aiohttp import web
 
 from laplace.adapter import InferenceAdapter, ModelLoadError
+from laplace.adapters.lmstudio import LMStudioAdapter
 from laplace.broker import ContentionBroker
 from laplace.reaper import Reaper
 
@@ -68,6 +69,9 @@ def build_app(
 
 async def _on_startup(app: web.Application) -> None:
     config = app[CONFIG]
+    adapter = app[ADAPTER]
+    if isinstance(adapter, LMStudioAdapter):
+        await adapter.validate_model_ids(set(config.model_context) | set(config.model_footprint_mb))
     # total=None: the default aiohttp total=300s covers the ENTIRE streamed body
     # read, so any proxied generation longer than 5 minutes would die mid-stream
     # with a TimeoutError. Streams must be uncapped end to end; keep only a
