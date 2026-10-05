@@ -1,4 +1,6 @@
 """Bounded recovery probes: fake CLI and clock, never a live lms process."""
+import json
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -101,12 +103,50 @@ async def test_nonzero_exit_late_instance_does_not_double_load(clock):
 
 
 @pytest.mark.asyncio
+async def test_nonzero_exit_window_is_grace_only_from_cli_return(clock, caplog):
+    rt = Runtime()
+    rt.adapter = lmstudio.LMStudioAdapter(load_timeout_s=300, load_grace_s=7)
+    original = rt.run
+
+    async def run(args, timeout):
+        if args[0] == 'load' and not rt.loads:
+            rt.loads.append(args[1])
+            clock.now = 112
+            return 1, '', 'Operation canceled'
+        return await original(args, timeout)
+
+    rt.adapter._run = run
+    with pytest.raises(ModelLoadError):
+        await rt.adapter.ensure_loaded(A, 4096)
+    clock.now = 118.999
+    with pytest.raises(ModelLoadError, match='unresolved'):
+        await rt.adapter.ensure_loaded(A, 4096)
+    clock.now = 119
+    await rt.adapter.ensure_loaded(A, 4096)
+    assert rt.loads == [A, A]
+    assert any(
+        record.levelno == logging.ERROR
+        and A in record.message
+        and 'reason=rc' in record.message
+        and 'window=7s' in record.message
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
 async def test_timeout_message_contains_duration_model_and_context(clock, caplog):
     rt = timeout_runtime(clock)
     message = f'lms load timed out after 10s for {A} at ctx=4096'
     with pytest.raises(ModelLoadError, match=message):
         await rt.adapter.ensure_loaded(A, 4096)
     assert message in caplog.text
+    assert any(
+        record.levelno == logging.ERROR
+        and A in record.message
+        and 'reason=timeout' in record.message
+        and 'window=100s' in record.message
+        for record in caplog.records
+    )
 
 
 @pytest.mark.asyncio
@@ -118,10 +158,10 @@ async def test_custom_grace_and_fresh_failed_inventory(clock):
     with pytest.raises(ModelLoadError):
         await rt.adapter.ensure_loaded(A, 4096)
     rt.fail_load = False
-    clock.now = 116.999
+    clock.now = 106.999
     with pytest.raises(ModelLoadError):
         await rt.adapter.ensure_loaded(A, 4096)
-    clock.now = 117
+    clock.now = 107
     rt.flaky_ps = True
     with pytest.raises(ModelLoadError, match='cannot establish residency'):
         await rt.adapter.ensure_loaded(A, 4096)
@@ -140,6 +180,52 @@ async def test_unidentified_new_instance_prevents_expired_retry(clock):
     with pytest.raises(ModelLoadError, match='unresolved'):
         await rt.adapter.ensure_loaded(A, 4096)
     assert rt.loads == [A]
+
+
+@pytest.mark.asyncio
+async def test_newly_cataloged_external_instance_does_not_wedge_expired_retry(clock, caplog):
+    rt = timeout_runtime(clock)
+    original = rt.adapter._run
+    catalog = {A, B}
+
+    async def run(args, timeout):
+        if args[0] == 'ls':
+            return 0, json.dumps([{'modelKey': key} for key in catalog]), ''
+        return await original(args, timeout)
+
+    rt.adapter._run = run
+    with pytest.raises(ModelLoadError):
+        await rt.adapter.ensure_loaded(A, 4096)
+    catalog.add('catalog/newly-downloaded')
+    rt.rows = [resident('catalog/newly-downloaded')]
+    clock.now = 200
+    await rt.adapter.ensure_loaded(A, 4096)
+    assert rt.loads == [A, A]
+    assert any(
+        record.levelno == logging.ERROR
+        and 'window expired' in record.message
+        and A in record.message
+        and 'window=100s' in record.message
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_persisting_unidentified_wedge_logs_once_at_error(clock, caplog):
+    rt = timeout_runtime(clock)
+    with pytest.raises(ModelLoadError):
+        await rt.adapter.ensure_loaded(A, 4096)
+    rt.rows = [resident('unidentified')]
+    clock.now = 200
+    for _ in range(2):
+        with pytest.raises(ModelLoadError, match='operator reconciliation required'):
+            await rt.adapter.ensure_loaded(A, 4096)
+    wedge_logs = [
+        record for record in caplog.records
+        if record.levelno == logging.ERROR
+        and 'operator reconciliation required' in record.message
+    ]
+    assert len(wedge_logs) == 1
 
 
 @pytest.mark.asyncio
