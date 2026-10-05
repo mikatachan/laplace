@@ -51,6 +51,8 @@ async def test_load_timeout_param_passed_to_run():
     loaded = False
 
     async def fake_run(args, timeout):
+        if args == ["ls", "--json"]:
+            return (0, '[{"modelKey": "some/model"}]', "")
         nonlocal loaded
         if args[:2] == ["ps", "--json"]:
             return (0, '[{"identifier": "some/model", "contextLength": 4096}]' if loaded else "[]", "")
@@ -70,6 +72,8 @@ async def test_load_timeout_defaults_to_180():
     loaded = False
 
     async def fake_run(args, timeout):
+        if args == ["ls", "--json"]:
+            return (0, '[{"modelKey": "some/model"}]', "")
         nonlocal loaded
         if args[:2] == ["ps", "--json"]:
             return (0, '[{"identifier": "some/model", "contextLength": 4096}]' if loaded else "[]", "")
@@ -87,6 +91,8 @@ async def test_ensure_loaded_raises_when_load_command_fails():
     adapter = LMStudioAdapter()
 
     async def fake_run(args, timeout):
+        if args == ["ls", "--json"]:
+            return (0, '[{"modelKey": "some/model"}]', "")
         if args[:2] == ["ps", "--json"]:
             return (0, "[]", "")
         return (1, "", "load failed")
@@ -102,6 +108,8 @@ async def test_ensure_loaded_raises_when_model_never_appears():
     calls = {"ps": 0}
 
     async def fake_run(args, timeout):
+        if args == ["ls", "--json"]:
+            return (0, '[{"modelKey": "some/model"}]', "")
         if args[:2] == ["ps", "--json"]:
             calls["ps"] += 1
             return (0, "[]", "")
@@ -110,4 +118,4 @@ async def test_ensure_loaded_raises_when_model_never_appears():
     adapter._run = fake_run
     with pytest.raises(ModelLoadError, match="did not become resident"):
         await adapter.ensure_loaded("some/model", 4096)
-    assert calls["ps"] == 2
+    assert calls["ps"] == 3  # fast path, locked recheck, post-load verification

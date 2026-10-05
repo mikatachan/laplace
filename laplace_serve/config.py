@@ -43,6 +43,7 @@ class LaplacedConfig:
     reaper_sweep: bool = True
     sweep_interval_s: float = 60.0
     load_timeout_s: float = 300.0
+    load_grace_s: float = 90.0
     keep_loaded: tuple[str, ...] = ("nomic-embed-text",)
     default_context_length: int = 64000
     log_rotate_mb: int = 10
