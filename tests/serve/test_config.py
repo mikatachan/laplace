@@ -33,6 +33,7 @@ def test_full_toml_parses():
         "reaper_sweep": True,
         "sweep_interval_s": 60,
         "load_timeout_s": 300,
+        "load_grace_s": 17,
         "keep_loaded": ["nomic-embed-text"],
         "default_context_length": 64000,
         "log_rotate_mb": 10,
@@ -45,6 +46,14 @@ def test_full_toml_parses():
     assert config.keep_loaded == ("nomic-embed-text",)
     assert config.model_context["qwen3-next-80b-a3b-thinking"] == 131072
     assert config.model_footprint_mb["qwen3-next-80b-a3b-thinking"] == 48000
+    assert config.load_grace_s == 17
+
+
+def test_toml_loader_accepts_load_grace_s(tmp_path):
+    path = tmp_path / "laplaced.toml"
+    path.write_text("load_grace_s = 23\n")
+
+    assert LaplacedConfig.from_toml_file(str(path)).load_grace_s == 23
 
 
 def test_bad_tier_rejected():
