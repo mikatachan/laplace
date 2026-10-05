@@ -95,3 +95,45 @@ See the assessment in `docs/`. Closest adjacent tools: **llama-swap** (own-proce
 
 ## License
 MIT.
+
+LM Studio load mutations are serialized within each adapter. A fresh read-only
+residency check runs before the lock and any failure guard: a single matching
+instance with sufficient context admits even while another model is loading.
+Cold loads require a second successful snapshot under the lock and an exact
+`lms ls --json` catalog key. Failed inventory reads never mean empty inventory.
+Existing instances (including `:N` identifiers and matching model keys/paths)
+prevent another load. Insufficient or missing context fails admission; it is
+rechecked on each request, not cached. Automatic context upgrades are not done:
+this adapter cannot prove an instance is idle for external clients, and has no
+atomic reservation-and-unload interface. An operator must reconcile that instance.
+
+A timed-out CLI is killed and reaped. Timeouts, cancellation, nonzero exits, and
+successful commands without a visible result retain the load's monotonic start
+time. Until `load_timeout_s + load_grace_s` has elapsed from that start, unresolved
+loads block cold loads of **any** model: pending server work is absent from the
+broker's resident-memory budget. Resident admissions still use the fast path.
+`load_grace_s` defaults to 90 seconds and is configurable on `LMStudioAdapter` and
+as a top-level `laplaced.toml` option.
+
+Each admission takes a fresh inventory. A matching resident reconciles uncertainty;
+after the deadline, no new matching or unidentified instance marks the attempt
+failed and permits retry. Failed inventory reads retain the restriction. Known
+other catalog models do not prevent recovery. A flaky verification read recovers
+when the requested model is present, including before the deadline.
+
+A possible fuzzy result disables retries for that requested ID until sufficient
+residency is verified. The failure record then clears; unrelated catalog changes
+do not permit retries. No snapshot difference proves ownership, so verification never unloads
+new instances automatically, including unknown identifiers. Known other catalog
+keys are excluded from fuzzy candidates. Operator cleanup may therefore be needed.
+
+Bounded retry assumes server work becomes visible or stops within the configured
+window. Killing `lms` does not establish cancellation of server-side work, and an
+empty `ps` cannot prove that no server load is pending. The grace window is an
+operational bound, not a server cancellation guarantee; choose it accordingly.
+An unidentified new instance remains blocked for operator reconciliation even
+after the deadline. This is a process-local guard; concurrent external loads of
+the SAME model require coordination beyond this adapter.
+
+Startup logs ERRORs for configured context/footprint keys absent from the catalog,
+including the closest key, but continues serving.
