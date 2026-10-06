@@ -225,6 +225,11 @@ class LMStudioAdapter:
                 log.error("%s", message)
                 raise ModelLoadError(message) from exc
             except Exception as exc:
+                # Handle the case where we have an unknown reason and need to log the window
+                pending = self._load_uncertain.get(base)
+                if pending and pending.reason == "unknown":
+                    pending.reason = "verify"
+                    self._log_uncertain_window(base, pending)
                 log.error("%s", exc)
                 raise ModelLoadError(str(exc)) from exc
             finally:
