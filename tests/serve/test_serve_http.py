@@ -377,7 +377,19 @@ async def test_model_load_failure_returns_503_without_upstream_proxy():
 
 
 @pytest.mark.asyncio
-async def test_guarded_load_refusal_returns_rounded_up_retry_after(monkeypatch):
+@pytest.mark.parametrize(
+    ("remaining", "expected"),
+    [
+        (89.3, "60"),
+        (59.2, "60"),
+        (12.1, "13"),
+    ],
+)
+async def test_guarded_load_refusal_returns_capped_rounded_up_retry_after(
+    monkeypatch,
+    remaining,
+    expected,
+):
     state = UpstreamState()
     clock = 100.0
     adapter = lmstudio.LMStudioAdapter(
@@ -400,7 +412,7 @@ async def test_guarded_load_refusal_returns_rounded_up_retry_after(monkeypatch):
     adapter._run = run
     with pytest.raises(ModelLoadError):
         await adapter.ensure_loaded("m", 64000)
-    clock = 128.8
+    clock = 190.0 - remaining
 
     upstream = web.Application()
     upstream.router.add_post("/v1/chat/completions", chat)
@@ -417,7 +429,7 @@ async def test_guarded_load_refusal_returns_rounded_up_retry_after(monkeypatch):
         )
 
         assert resp.status == 503
-        assert resp.headers["Retry-After"] == "62"
+        assert resp.headers["Retry-After"] == expected
 
     assert state.requests == []
 
