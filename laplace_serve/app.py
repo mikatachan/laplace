@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 from typing import Awaitable, Callable, Optional
 
@@ -186,6 +187,8 @@ async def _governed(request: web.Request) -> web.StreamResponse:
                 )
             return await request.app[PROXY].forward(request, _upstream_path(request), forwarded_body)
     except ModelLoadError as exc:
+        remaining = request.app[ADAPTER].guard_window_remaining_s()
+        retry_after = str(max(1, math.ceil(remaining))) if remaining is not None else "5"
         log.warning(
             "admission origin=%s tier=%s model=%s decision=load-failed detail=%s",
             origin,
@@ -196,7 +199,7 @@ async def _governed(request: web.Request) -> web.StreamResponse:
         return web.json_response(
             {"error": "model unavailable; load did not complete"},
             status=503,
-            headers={"Retry-After": "5"},
+            headers={"Retry-After": retry_after},
         )
 
 

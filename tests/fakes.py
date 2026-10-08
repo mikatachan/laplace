@@ -52,6 +52,9 @@ class FakeAdapter:
             context_length=context_length,
         )
 
+    def guard_window_remaining_s(self) -> float | None:
+        return None
+
     async def force_unload(self, model_id: str) -> bool:
         self.force_unload_calls.append(model_id)
         outcomes = self.unload_outcomes.get(model_id)
