@@ -248,6 +248,16 @@ class LMStudioAdapter:
             pending.window_s,
         )
 
+    def guard_window_remaining_s(self) -> float | None:
+        """Return the longest active uncertain-load guard duration."""
+        now = time.monotonic()
+        remaining = [
+            pending.started_at + pending.window_s - now
+            for pending in self._load_uncertain.values()
+        ]
+        active = [duration for duration in remaining if duration > 0]
+        return max(active, default=None)
+
     def _reconcile_uncertain(self, entries: list[dict], catalog_keys: set[str]) -> None:
         """Use the fresh locked snapshot before permitting any cold load."""
         for base, pending in list(self._load_uncertain.items()):
