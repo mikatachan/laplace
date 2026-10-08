@@ -53,9 +53,11 @@ def build_app(
     app.on_cleanup.append(_on_cleanup)
 
     app.router.add_post("/{origin}/v1/chat/completions", _governed)
+    app.router.add_post("/{origin}/v1/completions", _governed)
     app.router.add_post("/{origin}/v1/responses", _governed)
     app.router.add_post("/{origin}/v1/embeddings", _governed)
     app.router.add_post("/v1/chat/completions", _governed)
+    app.router.add_post("/v1/completions", _governed)
     app.router.add_post("/v1/responses", _governed)
     app.router.add_post("/v1/embeddings", _governed)
 
@@ -71,7 +73,11 @@ async def _on_startup(app: web.Application) -> None:
     config = app[CONFIG]
     adapter = app[ADAPTER]
     if isinstance(adapter, LMStudioAdapter):
-        await adapter.validate_model_ids(set(config.model_context) | set(config.model_footprint_mb))
+        await adapter.validate_model_ids(
+            set(config.model_context)
+            | set(config.model_footprint_mb)
+            | set(config.model_parallel)
+        )
     # total=None: the default aiohttp total=300s covers the ENTIRE streamed body
     # read, so any proxied generation longer than 5 minutes would die mid-stream
     # with a TimeoutError. Streams must be uncapped end to end; keep only a

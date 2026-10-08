@@ -13,6 +13,7 @@ def test_defaults_match_plan():
     assert config.max_concurrent == 2
     assert config.default_context_length == 64000
     assert config.tier_for("hermes") == "interactive"
+    assert config.tier_for("bot") == "interactive"
     assert config.tier_for("default") == "scheduled"
 
 
@@ -41,11 +42,13 @@ def test_full_toml_parses():
         "origins": {"hermes": "interactive", "openclaw": "interactive", "default": "scheduled"},
         "model_context": {"qwen3-next-80b-a3b-thinking": 131072, "nomic-embed-text": 2048},
         "model_footprint_mb": {"qwen3-next-80b-a3b-thinking": 48000},
+        "model_parallel": {"qwen3-next-80b-a3b-thinking": 1},
     }
     config = LaplacedConfig.from_dict(data)
     assert config.keep_loaded == ("nomic-embed-text",)
     assert config.model_context["qwen3-next-80b-a3b-thinking"] == 131072
     assert config.model_footprint_mb["qwen3-next-80b-a3b-thinking"] == 48000
+    assert config.model_parallel["qwen3-next-80b-a3b-thinking"] == 1
     assert config.load_grace_s == 17
 
 
@@ -64,6 +67,11 @@ def test_bad_tier_rejected():
 def test_bad_footprint_type_rejected():
     with pytest.raises(ValueError):
         LaplacedConfig.from_dict({"model_footprint_mb": {"m": "lots"}})
+
+
+def test_bad_parallel_rejected():
+    with pytest.raises(ValueError, match="must be positive"):
+        LaplacedConfig.from_dict({"model_parallel": {"m": 0}})
 
 
 def test_missing_context_ids_lists_gaps():
@@ -123,3 +131,12 @@ def test_load_grace_default_and_override_reach_adapter():
     assert default._load_grace_s == 90
     custom, _, _ = build_components(LaplacedConfig.from_dict({"load_grace_s": 17}))
     assert custom._load_grace_s == 17
+
+
+def test_model_parallel_reaches_adapter_only_when_configured():
+    default, _, _ = build_components(LaplacedConfig.from_dict({}))
+    assert default._parallel_overrides == {}
+    custom, _, _ = build_components(
+        LaplacedConfig.from_dict({"model_parallel": {"org/model": 1}})
+    )
+    assert custom._parallel_overrides == {"org/model": 1}

@@ -66,6 +66,51 @@ async def test_load_timeout_param_passed_to_run():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("parallel_overrides", "expected_load"),
+    [
+        (None, ["load", "some/model", "--context-length", "4096", "-y"]),
+        (
+            {"some/model": 1},
+            [
+                "load",
+                "some/model",
+                "--context-length",
+                "4096",
+                "--parallel",
+                "1",
+                "-y",
+            ],
+        ),
+    ],
+)
+async def test_parallel_load_args_are_opt_in(parallel_overrides, expected_load):
+    adapter = LMStudioAdapter(parallel_overrides=parallel_overrides)
+    loaded = False
+    load_args = None
+
+    async def fake_run(args, timeout):
+        nonlocal loaded, load_args
+        if args == ["ls", "--json"]:
+            return (0, '[{"modelKey": "some/model"}]', "")
+        if args[:2] == ["ps", "--json"]:
+            return (
+                0,
+                '[{"identifier": "some/model", "contextLength": 4096}]'
+                if loaded
+                else "[]",
+                "",
+            )
+        load_args = args
+        loaded = True
+        return (0, "", "")
+
+    adapter._run = fake_run
+    await adapter.ensure_loaded("some/model", 4096)
+    assert load_args == expected_load
+
+
+@pytest.mark.asyncio
 async def test_load_timeout_defaults_to_180():
     adapter = LMStudioAdapter()
     seen: dict[str, float] = {}
