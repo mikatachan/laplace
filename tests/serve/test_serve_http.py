@@ -4,12 +4,14 @@ import asyncio
 import json
 import logging
 import time
+from types import SimpleNamespace
 
 import aiohttp
 import pytest
 from aiohttp import web
 
 from laplace.adapter import ModelLoadError
+from laplace.adapters import lmstudio
 from laplace.broker import ContentionBroker
 from laplace.reaper import Reaper
 from laplace_serve.config import LaplacedConfig
@@ -368,7 +370,54 @@ async def test_model_load_failure_returns_503_without_upstream_proxy():
             headers={"Content-Type": "application/json"},
         )
         assert resp.status == 503
+        assert resp.headers["Retry-After"] == "5"
         assert (await resp.json())["error"] == "model unavailable; load did not complete"
+
+    assert state.requests == []
+
+
+@pytest.mark.asyncio
+async def test_guarded_load_refusal_returns_rounded_up_retry_after(monkeypatch):
+    state = UpstreamState()
+    clock = 100.0
+    adapter = lmstudio.LMStudioAdapter(
+        load_timeout_s=300,
+        footprint_overrides={"m": 100},
+    )
+
+    async def run(args, timeout):
+        if args[0] == "ps":
+            return 0, "[]", ""
+        if args[0] == "ls":
+            return 0, '[{"modelKey": "m"}]', ""
+        return 1, "", "Operation canceled"
+
+    async def chat(request):
+        _record(state, request, await request.read())
+        return web.json_response({"ok": True})
+
+    monkeypatch.setattr(lmstudio, "time", SimpleNamespace(monotonic=lambda: clock))
+    adapter._run = run
+    with pytest.raises(ModelLoadError):
+        await adapter.ensure_loaded("m", 64000)
+    clock = 128.8
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/chat/completions", chat)
+
+    async with make_harness(
+        upstream_app=upstream,
+        upstream_state=state,
+        adapter=adapter,
+    ) as h:
+        resp = await h.client.post(
+            "/hermes/v1/chat/completions",
+            data=_json_body(model="m"),
+            headers={"Content-Type": "application/json"},
+        )
+
+        assert resp.status == 503
+        assert resp.headers["Retry-After"] == "62"
 
     assert state.requests == []
 
