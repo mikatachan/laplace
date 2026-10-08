@@ -52,6 +52,7 @@ log_backups = 5
 [origins]
 hermes = "interactive"   # ratified: user waits in Discord threads
 openclaw = "interactive"
+bot = "interactive"
 default = "scheduled"
 
 [model_context]                # operating ctx, not max window (D12)
@@ -63,6 +64,12 @@ default = "scheduled"
 "txgsync/gpt-oss-120b-derestricted" = 64000
 "glm-4.5-air-106b" = 64000
 "nomic-embed-text" = 2048
+
+[model_parallel]
+"qwen3-next-80b-a3b-thinking" = 1
+"glm-4.5-air-106b" = 1
+"txgsync/gpt-oss-120b-derestricted" = 1
+"qwen3.5-122b-a10b" = 1
 
 [model_footprint_mb]           # provisional, unvalidated — P3 gate finalizes (D13)
 "qwen3-next-80b-a3b-thinking" = 48000

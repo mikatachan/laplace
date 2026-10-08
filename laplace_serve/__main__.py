@@ -31,6 +31,7 @@ def build_components(
         load_timeout_s=config.load_timeout_s,
         load_grace_s=config.load_grace_s,
         footprint_overrides=dict(config.model_footprint_mb) or None,
+        parallel_overrides=dict(config.model_parallel) or None,
     )
     reaper = Reaper(adapter, keep_loaded=set(config.keep_loaded))
     broker = ContentionBroker(

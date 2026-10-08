@@ -85,6 +85,30 @@ async def test_admission_gating_end_to_end(caplog):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["/bot/v1/completions", "/v1/completions"])
+async def test_completions_routes_use_governed_handler(route, caplog):
+    state = UpstreamState()
+
+    async def completions(request):
+        body = await request.read()
+        _record(state, request, body)
+        return web.json_response({"ok": True})
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/completions", completions)
+    caplog.set_level(logging.INFO, logger="laplace_serve.app")
+
+    async with make_harness(upstream_app=upstream, upstream_state=state) as h:
+        response = await h.client.post(route, json={"model": "m", "prompt": "hi"})
+        assert response.status == 200
+
+    assert state.requests[0]["path"] == "/v1/completions"
+    expected_origin = "bot" if route.startswith("/bot/") else "default"
+    assert f"admission origin={expected_origin}" in caplog.text
+    assert h.adapter.ensure_loaded_calls == [("m", 64000)]
+
+
+@pytest.mark.asyncio
 async def test_bare_model_id_is_canonical_for_admission_and_upstream():
     state = UpstreamState()
 

@@ -39,6 +39,7 @@ class LMStudioAdapter:
         load_timeout_s: float = 180.0,
         footprint_overrides: dict[str, int] | None = None,
         load_grace_s: float = 90.0,
+        parallel_overrides: dict[str, int] | None = None,
     ):
         self._explicit_cli = lms_cli
         self._lms_cli = self._expand_home(lms_cli or _DEFAULT_LMS_CLI)
@@ -46,6 +47,7 @@ class LMStudioAdapter:
         self._load_timeout_s = load_timeout_s
         self._load_grace_s = load_grace_s
         self._footprint_overrides = self._normalize_overrides(footprint_overrides)
+        self._parallel_overrides = self._normalize_overrides(parallel_overrides)
         self._footprint_cache: dict[str, int | None] = {}
         # Serialize mutations; resident admissions never wait for this lock.
         self._load_lock = asyncio.Lock()
@@ -199,10 +201,12 @@ class LMStudioAdapter:
             )
             self._active_load = base
             try:
-                rc, out, err = await self._run(
-                    ["load", model_id, "--context-length", str(context_length), "-y"],
-                    timeout=self._load_timeout_s,
-                )
+                load_args = ["load", model_id, "--context-length", str(context_length)]
+                parallel = self._parallel_overrides.get(base)
+                if parallel is not None:
+                    load_args.extend(["--parallel", str(parallel)])
+                load_args.append("-y")
+                rc, out, err = await self._run(load_args, timeout=self._load_timeout_s)
                 if rc != 0:
                     pending = self._load_uncertain[base]
                     pending.started_at = time.monotonic()

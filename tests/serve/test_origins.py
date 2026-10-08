@@ -13,6 +13,18 @@ def test_path_prefix_tags_origin_and_tier():
     assert origins.resolve("openclaw", {}, _CONFIG) == ("openclaw", "interactive")
 
 
+def test_default_config_marks_bot_interactive():
+    config = LaplacedConfig.from_dict({})
+    assert origins.resolve("bot", {}, config) == ("bot", "interactive")
+
+
+def test_explicit_origins_table_gets_bot_default():
+    config = LaplacedConfig.from_dict(
+        {"origins": {"hermes": "interactive", "default": "scheduled"}}
+    )
+    assert origins.resolve("bot", {}, config) == ("bot", "interactive")
+
+
 def test_bare_v1_maps_to_default_origin():
     assert origins.resolve(None, {}, _CONFIG) == ("default", "scheduled")
 
