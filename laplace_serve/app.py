@@ -61,9 +61,11 @@ def build_app(
     app.on_cleanup.append(_on_cleanup)
 
     app.router.add_post("/{origin}/v1/chat/completions", _governed)
+    app.router.add_post("/{origin}/v1/completions", _governed)
     app.router.add_post("/{origin}/v1/responses", _governed)
     app.router.add_post("/{origin}/v1/embeddings", _governed)
     app.router.add_post("/v1/chat/completions", _governed)
+    app.router.add_post("/v1/completions", _governed)
     app.router.add_post("/v1/responses", _governed)
     app.router.add_post("/v1/embeddings", _governed)
 
@@ -79,7 +81,11 @@ async def _on_startup(app: web.Application) -> None:
     config = app[CONFIG]
     adapter = app[ADAPTER]
     if isinstance(adapter, LMStudioAdapter):
-        model_ids = set(config.model_context) | set(config.model_footprint_mb)
+        model_ids = (
+            set(config.model_context)
+            | set(config.model_footprint_mb)
+            | set(config.model_parallel)
+        )
         if not await adapter.validate_model_ids(model_ids):
             # Boot raced LM Studio startup: the catalog was unreachable, so
             # stale configured ids were never reported. Retry in the background
