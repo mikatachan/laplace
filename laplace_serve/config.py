@@ -15,6 +15,7 @@ log = logging.getLogger(__name__)
 _DEFAULT_ORIGINS: dict[str, str] = {
     "hermes": "interactive",
     "openclaw": "interactive",
+    "bot": "interactive",
     "default": "scheduled",
 }
 
@@ -52,6 +53,7 @@ class LaplacedConfig:
     origins: Mapping[str, str] = field(default_factory=lambda: dict(_DEFAULT_ORIGINS))
     model_context: Mapping[str, int] = field(default_factory=dict)
     model_footprint_mb: Mapping[str, int] = field(default_factory=dict)
+    model_parallel: Mapping[str, int] = field(default_factory=dict)
 
     def budget_mb_or_none(self) -> int | None:
         """Broker budget: None triggers auto-detection, a positive value pins it."""
@@ -74,7 +76,11 @@ class LaplacedConfig:
         """
         if not model_id:
             return model_id
-        configured = set(self.model_context) | set(self.model_footprint_mb)
+        configured = (
+            set(self.model_context)
+            | set(self.model_footprint_mb)
+            | set(self.model_parallel)
+        )
         if model_id in configured:
             return model_id
         matches = [key for key in configured if key.rsplit("/", 1)[-1] == model_id]
@@ -102,6 +108,15 @@ class LaplacedConfig:
         model_footprint_mb = _coerce_int_map(
             raw.pop("model_footprint_mb", None), "model_footprint_mb"
         )
+        model_parallel = _coerce_int_map(
+            raw.pop("model_parallel", None), "model_parallel"
+        )
+        for model_id, parallel in model_parallel.items():
+            if parallel <= 0:
+                raise ValueError(
+                    f"laplaced config: [model_parallel] value for {model_id!r} "
+                    f"must be positive, got {parallel!r}"
+                )
 
         for origin, tier in origins.items():
             try:
@@ -111,6 +126,7 @@ class LaplacedConfig:
                     f"laplaced config: origin {origin!r} has invalid tier {tier!r}; "
                     "expected one of interactive/scheduled/dreaming"
                 ) from None
+        origins.setdefault("bot", "interactive")
         origins.setdefault(DEFAULT_ORIGIN, "scheduled")
 
         known = {f.name for f in fields(cls)}
@@ -125,6 +141,7 @@ class LaplacedConfig:
             origins=origins,
             model_context=model_context,
             model_footprint_mb=model_footprint_mb,
+            model_parallel=model_parallel,
             **kwargs,
         )
 
