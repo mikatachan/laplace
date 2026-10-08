@@ -116,6 +116,7 @@ async def _retry_startup_validation(
         try:
             ok = await adapter.validate_model_ids(model_ids)
         except Exception:  # noqa: BLE001 - a background task must not die on a bug
+            log.exception("lmstudio startup model validation retry %d raised", attempt)
             ok = False
         if ok:
             log.info("lmstudio startup model validation retry %d succeeded", attempt)
@@ -128,9 +129,8 @@ async def _retry_startup_validation(
 
 async def _on_cleanup(app: web.Application) -> None:
     app[REAPER].stop_sweep_loop()
-    session = app.get(SESSION)
-    if session is not None:
-        await session.close()
+    # Cancel the retry task BEFORE closing the session: a failure while
+    # closing must not skip the cancel and leave the task running.
     task = app.get(STARTUP_VALIDATION_RETRY_TASK)
     if task is not None and not task.done():
         task.cancel()
@@ -138,6 +138,9 @@ async def _on_cleanup(app: web.Application) -> None:
             await task
         except asyncio.CancelledError:
             pass
+    session = app.get(SESSION)
+    if session is not None:
+        await session.close()
 
 
 async def _governed(request: web.Request) -> web.StreamResponse:

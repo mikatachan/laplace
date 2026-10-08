@@ -49,6 +49,18 @@ def _unavailable_adapter() -> LMStudioAdapter:
     return adapter
 
 
+class _RaisingAdapter(LMStudioAdapter):
+    """LMStudioAdapter whose validate_model_ids raises on every call."""
+
+    def __init__(self):
+        super().__init__()
+        self.validate_calls = 0
+
+    async def validate_model_ids(self, model_ids: set[str]) -> bool:
+        self.validate_calls += 1
+        raise RuntimeError("boom")
+
+
 @pytest.mark.asyncio
 async def test_validate_model_ids_false_when_catalog_unavailable():
     adapter = _unavailable_adapter()
@@ -108,6 +120,25 @@ async def test_retry_loop_gives_up_after_six_retries(monkeypatch, caplog):
     with caplog.at_level(logging.ERROR, logger="laplace_serve.app"):
         await app_module._retry_startup_validation(adapter, {"some/model"})
     assert adapter.validate_calls == 6
+    assert "lmstudio startup model validation gave up after 6 retries" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_retry_loop_survives_raising_validation(monkeypatch, caplog):
+    # A bug in validate_model_ids must not kill the background task: each
+    # attempt logs the exception, and after six failed attempts it gives up.
+    monkeypatch.setattr(app_module, "STARTUP_VALIDATION_RETRY_DELAYS", ZERO_DELAYS)
+    adapter = _RaisingAdapter()
+
+    with caplog.at_level(logging.ERROR, logger="laplace_serve.app"):
+        await app_module._retry_startup_validation(adapter, {"some/model"})
+
+    assert adapter.validate_calls == 6
+    for attempt in range(1, 7):
+        assert (
+            f"lmstudio startup model validation retry {attempt} raised" in caplog.text
+        )
+    assert "boom" in caplog.text  # the traceback was logged, not swallowed silently
     assert "lmstudio startup model validation gave up after 6 retries" in caplog.text
 
 
