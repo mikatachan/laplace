@@ -134,6 +134,29 @@ async def test_nonzero_exit_window_is_grace_only_from_cli_return(clock, caplog):
 
 
 @pytest.mark.asyncio
+async def test_rc_guard_reports_remaining_seconds_and_expires(clock):
+    rt = Runtime()
+    rt.fail_load = True
+    with pytest.raises(ModelLoadError):
+        await rt.adapter.ensure_loaded(A, 4096)
+
+    clock.now = 128.8
+    assert rt.adapter.guard_window_remaining_s() == pytest.approx(61.2)
+    clock.now = 190
+    assert rt.adapter.guard_window_remaining_s() is None
+
+
+@pytest.mark.asyncio
+async def test_timeout_guard_reports_remaining_from_load_start(clock):
+    rt = timeout_runtime(clock)
+    with pytest.raises(ModelLoadError):
+        await rt.adapter.ensure_loaded(A, 4096)
+
+    clock.now = 138.8
+    assert rt.adapter.guard_window_remaining_s() == pytest.approx(61.2)
+
+
+@pytest.mark.asyncio
 async def test_timeout_message_contains_duration_model_and_context(clock, caplog):
     rt = timeout_runtime(clock)
     message = f'lms load timed out after 10s for {A} at ctx=4096'

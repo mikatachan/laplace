@@ -37,6 +37,9 @@ class InferenceAdapter(Protocol):
     async def ensure_loaded(self, model_id: str, context_length: int | None) -> None:
         """Ensure ``model_id`` is resident at the requested context length."""
 
+    def guard_window_remaining_s(self) -> float | None:
+        """Return the active uncertain-load guard duration, if any."""
+
     async def force_unload(self, model_id: str) -> bool:
         """Unload ``model_id`` and verify it is gone."""
 
