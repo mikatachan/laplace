@@ -364,21 +364,26 @@ class LMStudioAdapter:
                 )
             await asyncio.sleep(0.1)
 
-    async def validate_model_ids(self, model_ids: set[str]) -> None:
-        """Report stale configured keys without preventing daemon startup."""
+    async def validate_model_ids(self, model_ids: set[str]) -> bool:
+        """Report stale configured keys without preventing daemon startup.
+
+        Returns True when the catalog was reachable (validation ran, including
+        the no-op for an empty id set) and False when it was unavailable.
+        """
         if not model_ids:
-            return
+            return True
         try:
             keys = await self._catalog_keys()
         except ModelLoadError as exc:
             log.error("lmstudio startup model validation unavailable: %s", exc)
-            return
+            return False
         for model_id in sorted(model_ids - keys):
             closest = difflib.get_close_matches(model_id, sorted(keys), n=1, cutoff=0)
             log.error(
                 "lmstudio configured model id %s has no exact catalog match; closest key: %s",
                 model_id, closest[0] if closest else "<empty catalog>",
             )
+        return True
 
     async def _catalog_keys(self) -> set[str]:
         try:

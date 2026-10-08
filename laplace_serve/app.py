@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 import os
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Optional
 
 import aiohttp
 from aiohttp import web
@@ -25,6 +25,11 @@ log = logging.getLogger(__name__)
 
 _DEFAULT_LMS_CANDIDATES = ("~/.lmstudio/bin/lms", "lms")
 
+# Wait before each startup-validation retry after the catalog was unavailable
+# at boot (laplaced can start before LM Studio is ready). Module-level so tests
+# can monkeypatch it to zeros; production waits 10..60s, six retries max.
+STARTUP_VALIDATION_RETRY_DELAYS: tuple[float, ...] = (10.0, 20.0, 40.0, 60.0, 60.0, 60.0)
+
 CONFIG = web.AppKey("config", LaplacedConfig)
 ADAPTER = web.AppKey("adapter", InferenceAdapter)
 REAPER = web.AppKey("reaper", Reaper)
@@ -32,6 +37,9 @@ BROKER = web.AppKey("broker", ContentionBroker)
 PROXY = web.AppKey("proxy", UpstreamProxy)
 SESSION = web.AppKey("session", aiohttp.ClientSession)
 READYZ_PS_CHECK = web.AppKey("readyz_ps_check", object)
+STARTUP_VALIDATION_RETRY_TASK = web.AppKey(
+    "startup_validation_retry_task", Optional[asyncio.Task]
+)
 
 
 def build_app(
@@ -71,7 +79,15 @@ async def _on_startup(app: web.Application) -> None:
     config = app[CONFIG]
     adapter = app[ADAPTER]
     if isinstance(adapter, LMStudioAdapter):
-        await adapter.validate_model_ids(set(config.model_context) | set(config.model_footprint_mb))
+        model_ids = set(config.model_context) | set(config.model_footprint_mb)
+        if not await adapter.validate_model_ids(model_ids):
+            # Boot raced LM Studio startup: the catalog was unreachable, so
+            # stale configured ids were never reported. Retry in the background
+            # (never blocking or failing startup) until it succeeds or exhausts.
+            app[STARTUP_VALIDATION_RETRY_TASK] = asyncio.create_task(
+                _retry_startup_validation(adapter, model_ids),
+                name="laplace:startup-validation-retry",
+            )
     # total=None: the default aiohttp total=300s covers the ENTIRE streamed body
     # read, so any proxied generation longer than 5 minutes would die mid-stream
     # with a TimeoutError. Streams must be uncapped end to end; keep only a
@@ -86,11 +102,42 @@ async def _on_startup(app: web.Application) -> None:
         app[REAPER].start_sweep_loop(config.sweep_interval_s)
 
 
+async def _retry_startup_validation(
+    adapter: LMStudioAdapter, model_ids: set[str]
+) -> None:
+    """Retry startup model validation in the background after an unavailable catalog.
+
+    Waits STARTUP_VALIDATION_RETRY_DELAYS between attempts (six retries max)
+    and stops at the first successful validation. Never raises: a boot race
+    must not take the daemon down, and _on_cleanup cancels us if we outlive it.
+    """
+    for attempt, delay in enumerate(STARTUP_VALIDATION_RETRY_DELAYS, start=1):
+        await asyncio.sleep(delay)
+        try:
+            ok = await adapter.validate_model_ids(model_ids)
+        except Exception:  # noqa: BLE001 - a background task must not die on a bug
+            ok = False
+        if ok:
+            log.info("lmstudio startup model validation retry %d succeeded", attempt)
+            return
+    log.error(
+        "lmstudio startup model validation gave up after %d retries",
+        len(STARTUP_VALIDATION_RETRY_DELAYS),
+    )
+
+
 async def _on_cleanup(app: web.Application) -> None:
     app[REAPER].stop_sweep_loop()
     session = app.get(SESSION)
     if session is not None:
         await session.close()
+    task = app.get(STARTUP_VALIDATION_RETRY_TASK)
+    if task is not None and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 async def _governed(request: web.Request) -> web.StreamResponse:
