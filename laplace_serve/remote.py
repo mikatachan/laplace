@@ -16,7 +16,6 @@ from laplace_serve.proxy import filter_request_headers, relay_after_commit
 
 PROBE_INTERVAL_S = 120.0
 PROBE_TIMEOUT_S = 10.0
-PRECOMMIT_TIMEOUT_S = 10.0
 QUEUE_TIMEOUT_S = 10.0
 FIRST_BYTE_TIMEOUT_S = 120.0
 FALLBACK_HTTP_STATUSES = frozenset({400, 404, 429})
@@ -258,7 +257,7 @@ class RemoteBackend:
                     params=request.query.copy() if request.query_string else None,
                     data=body or None,
                 ),
-                timeout=PRECOMMIT_TIMEOUT_S,
+                timeout=FIRST_BYTE_TIMEOUT_S,
             )
             if response.status == 401:
                 response.close()
@@ -269,7 +268,6 @@ class RemoteBackend:
                 status = response.status
                 response.close()
                 reason = f"upstream-{status}"
-                self.record_request_failure(reason)
                 return AttemptResult(failure_reason=reason)
             if 500 <= response.status <= 599:
                 response.close()
