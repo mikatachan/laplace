@@ -10,6 +10,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 
+import laplace_serve.remote as remote_module
 from laplace_serve.app import FLEET
 from laplace_serve.config import LaplacedConfig, RemoteBackendConfig
 from laplace_serve.remote import PROBE_INTERVAL_S, PROBE_TIMEOUT_S, RemoteBackend
@@ -86,6 +87,81 @@ async def test_no_credential_disables_backend_but_healthz_stays_200():
     assert health.status == 200
     assert status["backends"]["shinobi"]["state"] == "DISABLED"
     assert status["backends"]["shinobi"]["reason"] == "no-credential"
+
+
+@pytest.mark.asyncio
+async def test_disabled_backend_retries_auth_on_probe_cadence_and_recovers(monkeypatch):
+    auth_results = iter((None, "recovered-key"))
+    auth_calls = 0
+    probe_states = []
+
+    async def auth(_self):
+        nonlocal auth_calls
+        auth_calls += 1
+        return next(auth_results)
+
+    async def chat(_request):
+        probe_states.append(backend.state)
+        return _probe_response()
+
+    monkeypatch.setattr(RemoteBackend, "_run_auth_command", auth)
+    monkeypatch.setattr(remote_module, "PROBE_INTERVAL_S", 0.01)
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", chat)
+    server = await _start(app)
+    backend = RemoteBackend(
+        "shinobi",
+        RemoteBackendConfig(
+            url=str(server.make_url("")).rstrip("/"),
+            probe_model="probe-model",
+            auth_command=("stub",),
+        ),
+        active=True,
+    )
+    try:
+        await backend.start()
+        assert (backend.state, backend.reason, auth_calls) == (
+            "DISABLED",
+            "no-credential",
+            1,
+        )
+
+        async def wait_until_up():
+            while backend.state != "UP":
+                await asyncio.sleep(0.001)
+
+        await asyncio.wait_for(wait_until_up(), timeout=0.5)
+        assert (backend.state, backend.reason, auth_calls) == ("UP", None, 2)
+        assert probe_states == ["DOWN", "DOWN"]
+    finally:
+        await backend.close()
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_control_character_credential_is_disabled_without_disclosure(
+    monkeypatch, caplog
+):
+    sentinel = "bad-key\nnever-disclose"
+
+    async def auth(_self):
+        return sentinel
+
+    monkeypatch.setattr(RemoteBackend, "_run_auth_command", auth)
+    caplog.set_level(logging.DEBUG)
+    upstream = web.Application()
+    async with make_harness(
+        upstream_app=upstream,
+        config=_config("http://127.0.0.1:1"),
+    ) as harness:
+        snapshot = harness.client.app[FLEET].backends["shinobi"].snapshot()
+
+    assert (snapshot["state"], snapshot["reason"]) == (
+        "DISABLED",
+        "bad-credential",
+    )
+    assert sentinel not in caplog.text
+    assert sentinel not in json.dumps(snapshot)
 
 
 def test_probe_state_machine_transitions():
@@ -193,8 +269,11 @@ async def test_precommit_503_falls_back_to_axis():
             config=_config(str(remote_server.make_url("")).rstrip("/")),
         ) as harness:
             harness.client.app[FLEET].backends["shinobi"].state = "UP"
-            response = await harness.client.post(
-                "/bot/v1/chat/completions", json={"model": "m"}
+            response = await asyncio.wait_for(
+                harness.client.post(
+                    "/bot/v1/chat/completions", json={"model": "m"}
+                ),
+                timeout=0.5,
             )
             assert response.status == 200
             assert (await response.json())["backend"] == "axis"
@@ -202,6 +281,163 @@ async def test_precommit_503_falls_back_to_axis():
         await remote_server.close()
 
     assert (remote_requests, axis_requests) == (1, 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("remote_status", [400, 404, 429])
+async def test_precommit_client_status_falls_back_to_axis(remote_status):
+    async def remote_chat(request):
+        payload = await request.json()
+        if payload["model"] == "probe-model":
+            return _probe_response()
+        return web.json_response({"error": "remote rejection"}, status=remote_status)
+
+    async def axis_chat(_request):
+        return web.json_response({"backend": "axis"})
+
+    remote_app = web.Application()
+    remote_app.router.add_post("/v1/chat/completions", remote_chat)
+    remote_server = await _start(remote_app)
+    axis_app = web.Application()
+    axis_app.router.add_post("/v1/chat/completions", axis_chat)
+    try:
+        async with make_harness(
+            upstream_app=axis_app,
+            config=_config(str(remote_server.make_url("")).rstrip("/")),
+        ) as harness:
+            harness.client.app[FLEET].backends["shinobi"].state = "UP"
+            response = await asyncio.wait_for(
+                harness.client.post(
+                    "/bot/v1/chat/completions", json={"model": "m"}
+                ),
+                timeout=0.5,
+            )
+            assert response.status == 200
+            assert (await response.json())["backend"] == "axis"
+    finally:
+        await remote_server.close()
+
+
+@pytest.mark.asyncio
+async def test_connect_error_falls_back_to_axis():
+    async def axis_chat(_request):
+        return web.json_response({"backend": "axis"})
+
+    axis_app = web.Application()
+    axis_app.router.add_post("/v1/chat/completions", axis_chat)
+    async with make_harness(
+        upstream_app=axis_app,
+        config=_config("http://127.0.0.1:1"),
+    ) as harness:
+        harness.client.app[FLEET].backends["shinobi"].state = "UP"
+        response = await harness.client.post(
+            "/bot/v1/chat/completions", json={"model": "m"}
+        )
+        assert response.status == 200
+        assert (await response.json())["backend"] == "axis"
+
+
+@pytest.mark.asyncio
+async def test_header_timeout_falls_back_to_axis(monkeypatch):
+    release_remote = asyncio.Event()
+
+    async def remote_chat(request):
+        payload = await request.json()
+        if payload["model"] == "probe-model":
+            return _probe_response()
+        await release_remote.wait()
+        return web.json_response({"remote": True})
+
+    async def axis_chat(_request):
+        return web.json_response({"backend": "axis"})
+
+    monkeypatch.setattr(remote_module, "PRECOMMIT_TIMEOUT_S", 0.02)
+    remote_app = web.Application()
+    remote_app.router.add_post("/v1/chat/completions", remote_chat)
+    remote_server = await _start(remote_app)
+    axis_app = web.Application()
+    axis_app.router.add_post("/v1/chat/completions", axis_chat)
+    try:
+        async with make_harness(
+            upstream_app=axis_app,
+            config=_config(str(remote_server.make_url("")).rstrip("/")),
+        ) as harness:
+            harness.client.app[FLEET].backends["shinobi"].state = "UP"
+            response = await asyncio.wait_for(
+                harness.client.post(
+                    "/bot/v1/chat/completions", json={"model": "m"}
+                ),
+                timeout=0.5,
+            )
+            assert response.status == 200
+            assert (await response.json())["backend"] == "axis"
+    finally:
+        release_remote.set()
+        await remote_server.close()
+
+
+@pytest.mark.asyncio
+async def test_saturated_slot_times_out_and_falls_back_to_axis(monkeypatch):
+    async def axis_chat(_request):
+        return web.json_response({"backend": "axis"})
+
+    monkeypatch.setattr(remote_module, "QUEUE_TIMEOUT_S", 0.02)
+    axis_app = web.Application()
+    axis_app.router.add_post("/v1/chat/completions", axis_chat)
+    async with make_harness(
+        upstream_app=axis_app,
+        config=_config("http://127.0.0.1:1"),
+    ) as harness:
+        backend = harness.client.app[FLEET].backends["shinobi"]
+        backend.state = "UP"
+        await backend._slots.acquire()
+        try:
+            response = await asyncio.wait_for(
+                harness.client.post(
+                    "/bot/v1/chat/completions", json={"model": "m"}
+                ),
+                timeout=0.5,
+            )
+        finally:
+            backend._slots.release()
+
+        assert response.status == 200
+        assert (await response.json())["backend"] == "axis"
+        assert backend.queued == 0
+
+
+@pytest.mark.asyncio
+async def test_cancelled_slot_wait_does_not_leak_queued_counter():
+    backend = RemoteBackend(
+        "shinobi",
+        RemoteBackendConfig(
+            url="http://127.0.0.1:1",
+            probe_model="probe-model",
+            auth_command=("stub",),
+        ),
+        active=True,
+    )
+    backend.state = "UP"
+    backend._credential = "test-key"
+    backend._session = aiohttp.ClientSession()
+    await backend._slots.acquire()
+    request = type(
+        "StubRequest",
+        (),
+        {"method": "POST", "headers": {}, "query_string": "", "query": {}},
+    )()
+    task = asyncio.create_task(backend.forward(request, "/v1/chat/completions", b"{}"))
+    try:
+        while backend.queued == 0:
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert backend.queued == 0
+        assert backend.in_flight == 0
+    finally:
+        backend._slots.release()
+        await backend.close()
 
 
 @pytest.mark.asyncio
@@ -239,8 +475,8 @@ async def test_first_response_byte_commits_and_is_never_replayed():
                 "/bot/v1/chat/completions", json={"model": "m", "stream": True}
             )
             try:
-                received = await response.read()
-            except aiohttp.ClientError:
+                received = await asyncio.wait_for(response.read(), timeout=1.0)
+            except (aiohttp.ClientError, asyncio.TimeoutError):
                 received = b"committed"
     finally:
         await remote_server.close()
