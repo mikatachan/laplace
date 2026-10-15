@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from laplace.adapter import ModelLoadError
@@ -84,7 +86,7 @@ async def test_load_timeout_param_passed_to_run():
         ),
     ],
 )
-async def test_parallel_load_args_are_opt_in(parallel_overrides, expected_load):
+async def test_parallel_load_args_are_opt_in(parallel_overrides, expected_load, caplog):
     adapter = LMStudioAdapter(parallel_overrides=parallel_overrides)
     loaded = False
     load_args = None
@@ -106,8 +108,16 @@ async def test_parallel_load_args_are_opt_in(parallel_overrides, expected_load):
         return (0, "", "")
 
     adapter._run = fake_run
-    await adapter.ensure_loaded("some/model", 4096)
+    with caplog.at_level(logging.INFO, logger="laplace.adapters.lmstudio"):
+        await adapter.ensure_loaded("some/model", 4096)
     assert load_args == expected_load
+    exec_messages = [
+        record.message
+        for record in caplog.records
+        if record.message.startswith("lmstudio: exec lms ")
+    ]
+    assert exec_messages == [f"lmstudio: exec lms {' '.join(expected_load)}"]
+    assert ("--parallel 1" in exec_messages[0]) is (parallel_overrides is not None)
 
 
 @pytest.mark.asyncio
