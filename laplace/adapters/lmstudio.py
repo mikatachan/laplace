@@ -206,6 +206,7 @@ class LMStudioAdapter:
                 if parallel is not None:
                     load_args.extend(["--parallel", str(parallel)])
                 load_args.append("-y")
+                log.info("lmstudio: exec lms %s", " ".join(load_args))
                 rc, out, err = await self._run(load_args, timeout=self._load_timeout_s)
                 if rc != 0:
                     pending = self._load_uncertain[base]
