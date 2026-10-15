@@ -21,6 +21,7 @@ from laplace_serve import origins
 from laplace_serve.admission import govern
 from laplace_serve.config import LaplacedConfig
 from laplace_serve.proxy import UpstreamProxy
+from laplace_serve.remote import RemoteFleet
 
 log = logging.getLogger(__name__)
 
@@ -37,6 +38,7 @@ REAPER = web.AppKey("reaper", Reaper)
 BROKER = web.AppKey("broker", ContentionBroker)
 PROXY = web.AppKey("proxy", UpstreamProxy)
 SESSION = web.AppKey("session", aiohttp.ClientSession)
+FLEET = web.AppKey("fleet", RemoteFleet)
 READYZ_PS_CHECK = web.AppKey("readyz_ps_check", object)
 STARTUP_VALIDATION_RETRY_TASK = web.AppKey(
     "startup_validation_retry_task", Optional[asyncio.Task]
@@ -56,6 +58,7 @@ def build_app(
     app[ADAPTER] = adapter
     app[REAPER] = reaper
     app[BROKER] = broker
+    app[FLEET] = RemoteFleet(config.backends, config.placement)
     app[READYZ_PS_CHECK] = readyz_ps_check or (lambda: _lms_ps_ok(10.0))
 
     app.on_startup.append(_on_startup)
@@ -75,6 +78,7 @@ def build_app(
 
     app.router.add_get("/healthz", _healthz)
     app.router.add_get("/readyz", _readyz)
+    app.router.add_get("/fleet/status", _fleet_status)
     return app
 
 
@@ -105,6 +109,7 @@ async def _on_startup(app: web.Application) -> None:
     session = aiohttp.ClientSession(auto_decompress=False, timeout=timeout)
     app[SESSION] = session
     app[PROXY] = UpstreamProxy(session, config.upstream)
+    await app[FLEET].start()
     if config.reaper_sweep:
         app[REAPER].start_sweep_loop(config.sweep_interval_s)
 
@@ -136,6 +141,7 @@ async def _retry_startup_validation(
 
 async def _on_cleanup(app: web.Application) -> None:
     app[REAPER].stop_sweep_loop()
+    await app[FLEET].close()
     # Cancel the retry task BEFORE closing the session: a failure while
     # closing must not skip the cancel and leave the task running.
     task = app.get(STARTUP_VALIDATION_RETRY_TASK)
@@ -159,6 +165,37 @@ async def _governed(request: web.Request) -> web.StreamResponse:
     model = config.canonical_model_id(requested_model)
     forwarded_body = _canonicalize_forwarded_model(body, requested_model, model)
     ctx = config.model_context.get(model, config.default_context_length) if model else None
+
+    for backend_name in request.app[FLEET].route(origin, model):
+        if backend_name == "axis":
+            return await _forward_axis(
+                request, origin, tier, model, stream, ctx, forwarded_body
+            )
+        result = await request.app[FLEET].backends[backend_name].forward(
+            request, _upstream_path(request), forwarded_body
+        )
+        if result.response is not None:
+            return result.response
+        log.info(
+            "route origin=%s model=%s backend=%s reason=fallback:%s",
+            origin,
+            model or "-",
+            backend_name,
+            result.failure_reason,
+        )
+    return web.json_response({"error": "no backend available"}, status=502)
+
+
+async def _forward_axis(
+    request: web.Request,
+    origin: str,
+    tier: str,
+    model: str | None,
+    stream: bool,
+    ctx: int | None,
+    forwarded_body: bytes,
+) -> web.StreamResponse:
+    config = request.app[CONFIG]
 
     try:
         async with govern(
@@ -212,6 +249,10 @@ async def _ungoverned(request: web.Request) -> web.StreamResponse:
 async def _healthz(request: web.Request) -> web.Response:
     # Liveness only: the process is up and serving. No upstream calls.
     return web.json_response({"status": "ok"})
+
+
+async def _fleet_status(request: web.Request) -> web.Response:
+    return web.json_response(request.app[FLEET].snapshot())
 
 
 async def _readyz(request: web.Request) -> web.Response:

@@ -84,6 +84,28 @@ finally:
 
 *(API is settling as the extraction lands; see `EXTRACTION.md`.)*
 
+### Optional remote backends
+
+`laplaced.toml` may declare an OpenAI-compatible remote backend. A backend is
+inert until a `[placement]` entry names it; `axis` is the built-in local
+backend. Credentials are obtained from `auth_command` at startup and after a
+401, retained only in process memory, and never written to status or logs.
+
+```toml
+[backends.shinobi]
+url = "http://shinobi.example:1234"
+alt_urls = ["http://shinobi-tailnet.example:1234"]
+slots = 1
+probe_model = "google/gemma-4-e4b"
+auth_command = ["credential-helper", "read", "shinobi"]
+
+[placement]
+"bot:google/gemma-4-e4b" = ["shinobi", "axis"]
+```
+
+Remote state and fixed reason codes are available at `GET /fleet/status`.
+Omitting `[placement]` performs no credential command, probe, or remote request.
+
 ## Prior art / where Laplace fits
 
 See the assessment in `docs/`. Closest adjacent tools: **llama-swap** (own-process idle TTL), **ConductorAPI** (multi-runtime budgets+priority, early-stage), **ollamaMQ** (Ollama request-priority proxy), **LocalAI** (LRU + idle watchdog). None do external-tenant-aware reaping.
