@@ -285,7 +285,7 @@ async def test_precommit_503_falls_back_to_axis():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("remote_status", [400, 404, 429])
-async def test_precommit_client_status_falls_back_to_axis(remote_status):
+async def test_client_status_falls_back_without_marking_remote_down(remote_status):
     async def remote_chat(request):
         payload = await request.json()
         if payload["model"] == "probe-model":
@@ -305,7 +305,8 @@ async def test_precommit_client_status_falls_back_to_axis(remote_status):
             upstream_app=axis_app,
             config=_config(str(remote_server.make_url("")).rstrip("/")),
         ) as harness:
-            harness.client.app[FLEET].backends["shinobi"].state = "UP"
+            backend = harness.client.app[FLEET].backends["shinobi"]
+            backend.state = "UP"
             response = await asyncio.wait_for(
                 harness.client.post(
                     "/bot/v1/chat/completions", json={"model": "m"}
@@ -314,8 +315,57 @@ async def test_precommit_client_status_falls_back_to_axis(remote_status):
             )
             assert response.status == 200
             assert (await response.json())["backend"] == "axis"
+            assert backend.state == "UP"
+            assert backend.consecutive_failures == 0
     finally:
         await remote_server.close()
+
+
+@pytest.mark.asyncio
+async def test_400_then_normal_request_uses_remote():
+    remote_requests = 0
+    axis_requests = 0
+
+    async def remote_chat(request):
+        nonlocal remote_requests
+        payload = await request.json()
+        if payload["model"] == "probe-model":
+            return _probe_response()
+        remote_requests += 1
+        if remote_requests == 1:
+            return web.json_response({"error": "bad request"}, status=400)
+        return web.json_response({"backend": "remote"})
+
+    async def axis_chat(_request):
+        nonlocal axis_requests
+        axis_requests += 1
+        return web.json_response({"backend": "axis"})
+
+    remote_app = web.Application()
+    remote_app.router.add_post("/v1/chat/completions", remote_chat)
+    remote_server = await _start(remote_app)
+    axis_app = web.Application()
+    axis_app.router.add_post("/v1/chat/completions", axis_chat)
+    try:
+        async with make_harness(
+            upstream_app=axis_app,
+            config=_config(str(remote_server.make_url("")).rstrip("/")),
+        ) as harness:
+            backend = harness.client.app[FLEET].backends["shinobi"]
+            backend.state = "UP"
+            first = await harness.client.post(
+                "/bot/v1/chat/completions", json={"model": "m"}
+            )
+            second = await harness.client.post(
+                "/bot/v1/chat/completions", json={"model": "m"}
+            )
+            assert (await first.json())["backend"] == "axis"
+            assert (await second.json())["backend"] == "remote"
+            assert backend.state == "UP"
+    finally:
+        await remote_server.close()
+
+    assert (remote_requests, axis_requests) == (2, 1)
 
 
 @pytest.mark.asyncio
@@ -338,8 +388,54 @@ async def test_connect_error_falls_back_to_axis():
 
 
 @pytest.mark.asyncio
-async def test_header_timeout_falls_back_to_axis(monkeypatch):
+async def test_slow_headers_use_remote_without_marking_it_down(monkeypatch):
+    axis_requests = 0
+
+    async def remote_chat(request):
+        payload = await request.json()
+        if payload["model"] == "probe-model":
+            return _probe_response()
+        await asyncio.sleep(0.08)
+        return web.json_response({"backend": "remote"})
+
+    async def axis_chat(_request):
+        nonlocal axis_requests
+        axis_requests += 1
+        return web.json_response({"backend": "axis"})
+
+    monkeypatch.setattr(remote_module, "PRECOMMIT_TIMEOUT_S", 0.02, raising=False)
+    monkeypatch.setattr(remote_module, "FIRST_BYTE_TIMEOUT_S", 0.2)
+    remote_app = web.Application()
+    remote_app.router.add_post("/v1/chat/completions", remote_chat)
+    remote_server = await _start(remote_app)
+    axis_app = web.Application()
+    axis_app.router.add_post("/v1/chat/completions", axis_chat)
+    try:
+        async with make_harness(
+            upstream_app=axis_app,
+            config=_config(str(remote_server.make_url("")).rstrip("/")),
+        ) as harness:
+            backend = harness.client.app[FLEET].backends["shinobi"]
+            backend.state = "UP"
+            response = await asyncio.wait_for(
+                harness.client.post(
+                    "/bot/v1/chat/completions", json={"model": "m"}
+                ),
+                timeout=0.5,
+            )
+            assert response.status == 200
+            assert (await response.json())["backend"] == "remote"
+            assert backend.state == "UP"
+    finally:
+        await remote_server.close()
+
+    assert axis_requests == 0
+
+
+@pytest.mark.asyncio
+async def test_header_first_byte_timeout_falls_back_to_axis(monkeypatch):
     release_remote = asyncio.Event()
+    axis_requests = 0
 
     async def remote_chat(request):
         payload = await request.json()
@@ -349,9 +445,11 @@ async def test_header_timeout_falls_back_to_axis(monkeypatch):
         return web.json_response({"remote": True})
 
     async def axis_chat(_request):
+        nonlocal axis_requests
+        axis_requests += 1
         return web.json_response({"backend": "axis"})
 
-    monkeypatch.setattr(remote_module, "PRECOMMIT_TIMEOUT_S", 0.02)
+    monkeypatch.setattr(remote_module, "FIRST_BYTE_TIMEOUT_S", 0.02)
     remote_app = web.Application()
     remote_app.router.add_post("/v1/chat/completions", remote_chat)
     remote_server = await _start(remote_app)
@@ -374,6 +472,8 @@ async def test_header_timeout_falls_back_to_axis(monkeypatch):
     finally:
         release_remote.set()
         await remote_server.close()
+
+    assert axis_requests == 1
 
 
 @pytest.mark.asyncio
