@@ -16,7 +16,10 @@ from laplace_serve.proxy import filter_request_headers, relay_after_commit
 
 PROBE_INTERVAL_S = 120.0
 PROBE_TIMEOUT_S = 10.0
+PRECOMMIT_TIMEOUT_S = 10.0
+QUEUE_TIMEOUT_S = 10.0
 FIRST_BYTE_TIMEOUT_S = 120.0
+FALLBACK_HTTP_STATUSES = frozenset({400, 404, 429})
 
 
 @dataclass(frozen=True)
@@ -50,10 +53,10 @@ class RemoteBackend:
             return
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=3)
         self._session = aiohttp.ClientSession(auto_decompress=False, timeout=timeout)
-        if not await self._refresh_credential():
-            return
+        credential_ready = await self._refresh_credential()
         self._probe_task = asyncio.create_task(
-            self._probe_loop(), name=f"laplace:probe:{self.name}"
+            self._probe_loop(delay_first=not credential_ready),
+            name=f"laplace:probe:{self.name}",
         )
 
     async def close(self) -> None:
@@ -98,19 +101,29 @@ class RemoteBackend:
             self.state = "DISABLED"
             self.reason = "no-credential"
             return False
+        if not _is_header_safe_token(credential):
+            self._credential = None
+            self.state = "DISABLED"
+            self.reason = "bad-credential"
+            return False
         self._credential = credential
         if self.state == "DISABLED":
             self.state = "DOWN"
             self.reason = "not-probed"
         return True
 
-    async def _probe_loop(self) -> None:
+    async def _probe_loop(self, *, delay_first: bool = False) -> None:
+        if delay_first:
+            await asyncio.sleep(PROBE_INTERVAL_S)
         while True:
             await self.probe_once()
             await asyncio.sleep(PROBE_INTERVAL_S)
 
     async def probe_once(self) -> bool:
-        if self._session is None or self._credential is None:
+        if self._session is None:
+            return False
+        if self._credential is None and not await self._refresh_credential():
+            self.last_probe_at = time.time()
             return False
         payload = json.dumps(
             {
@@ -204,8 +217,15 @@ class RemoteBackend:
             return AttemptResult(failure_reason=f"state:{self.state.lower()}")
 
         self.queued += 1
-        await self._slots.acquire()
-        self.queued -= 1
+        try:
+            try:
+                await asyncio.wait_for(
+                    self._slots.acquire(), timeout=QUEUE_TIMEOUT_S
+                )
+            except asyncio.TimeoutError:
+                return AttemptResult(failure_reason="queue")
+        finally:
+            self.queued -= 1
         self.in_flight += 1
         try:
             if self.state != "UP":
@@ -230,18 +250,27 @@ class RemoteBackend:
         headers["Authorization"] = f"Bearer {self._credential}"
         response = None
         try:
-            response = await self._session.request(
-                request.method,
-                base_url + upstream_path,
-                headers=headers,
-                params=request.query.copy() if request.query_string else None,
-                data=body or None,
+            response = await asyncio.wait_for(
+                self._session.request(
+                    request.method,
+                    base_url + upstream_path,
+                    headers=headers,
+                    params=request.query.copy() if request.query_string else None,
+                    data=body or None,
+                ),
+                timeout=PRECOMMIT_TIMEOUT_S,
             )
             if response.status == 401:
                 response.close()
                 await self._refresh_credential()
                 self.record_request_failure("auth")
                 return AttemptResult(failure_reason="auth")
+            if response.status in FALLBACK_HTTP_STATUSES:
+                status = response.status
+                response.close()
+                reason = f"upstream-{status}"
+                self.record_request_failure(reason)
+                return AttemptResult(failure_reason=reason)
             if 500 <= response.status <= 599:
                 response.close()
                 self.record_request_failure("upstream-5xx")
@@ -279,6 +308,11 @@ class RemoteBackend:
         if self.active_url is None or self.active_url not in urls:
             return urls
         return (self.active_url,) + tuple(url for url in urls if url != self.active_url)
+
+
+def _is_header_safe_token(value: str) -> bool:
+    """Accept non-empty visible ASCII without whitespace or control bytes."""
+    return bool(value) and all(0x21 <= ord(char) <= 0x7E for char in value)
 
 
 class RemoteFleet:
