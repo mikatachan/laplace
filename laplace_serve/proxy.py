@@ -43,7 +43,7 @@ class UpstreamProxy:
         body: bytes,
     ) -> web.StreamResponse:
         url = self._upstream + upstream_path
-        headers = _filter_request_headers(request.headers)
+        headers = filter_request_headers(request.headers)
 
         try:
             upstream_resp = await self._session.request(
@@ -82,6 +82,14 @@ async def _relay(
     request: web.Request,
     upstream_resp: aiohttp.ClientResponse,
 ) -> web.StreamResponse:
+    return await relay_after_commit(request, upstream_resp, b"")
+
+
+async def relay_after_commit(
+    request: web.Request,
+    upstream_resp: aiohttp.ClientResponse,
+    first_chunk: bytes,
+) -> web.StreamResponse:
     response = web.StreamResponse(
         status=upstream_resp.status,
         headers=_filter_response_headers(upstream_resp.headers),
@@ -92,6 +100,8 @@ async def _relay(
     await response.prepare(request)
 
     try:
+        if first_chunk:
+            await response.write(first_chunk)
         async for chunk in upstream_resp.content.iter_any():
             await response.write(chunk)
     except (ConnectionResetError, asyncio.CancelledError):
@@ -115,7 +125,7 @@ async def _relay(
     return response
 
 
-def _filter_request_headers(headers) -> dict[str, str]:
+def filter_request_headers(headers) -> dict[str, str]:
     return {key: value for key, value in headers.items() if key.lower() not in _DROP_REQUEST}
 
 
