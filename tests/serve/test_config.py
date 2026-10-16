@@ -59,6 +59,47 @@ def test_toml_loader_accepts_load_grace_s(tmp_path):
     assert LaplacedConfig.from_toml_file(str(path)).load_grace_s == 23
 
 
+def test_toml_loader_accepts_remote_backend_and_placement(tmp_path):
+    path = tmp_path / "laplaced.toml"
+    path.write_text(
+        """
+[backends.shinobi]
+url = "http://127.0.0.1:1234/"
+alt_urls = ["http://127.0.0.2:1234/"]
+probe_model = "google/gemma-4-e4b"
+auth_command = ["/bin/echo", "sentinel-key"]
+
+[placement]
+"bot:google/gemma-4-e4b" = ["shinobi", "axis"]
+"""
+    )
+
+    config = LaplacedConfig.from_toml_file(str(path))
+
+    assert config.backends["shinobi"].url == "http://127.0.0.1:1234"
+    assert config.backends["shinobi"].alt_urls == ("http://127.0.0.2:1234",)
+    assert config.backends["shinobi"].slots == 1
+    assert config.backends["shinobi"].auth_command == ("/bin/echo", "sentinel-key")
+    assert config.placement["bot:google/gemma-4-e4b"] == ("shinobi", "axis")
+
+
+def test_auth_command_validation_does_not_echo_value():
+    sentinel = "credential-sentinel-should-not-escape"
+    with pytest.raises(ValueError) as caught:
+        LaplacedConfig.from_dict(
+            {
+                "backends": {
+                    "shinobi": {
+                        "url": "http://127.0.0.1:1234",
+                        "probe_model": "m",
+                        "auth_command": [sentinel, 3],
+                    }
+                }
+            }
+        )
+    assert sentinel not in str(caught.value)
+
+
 def test_bad_tier_rejected():
     with pytest.raises(ValueError):
         LaplacedConfig.from_dict({"origins": {"hermes": "urgent"}})

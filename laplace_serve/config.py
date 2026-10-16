@@ -27,6 +27,17 @@ DEFAULT_ORIGIN = "default"
 
 
 @dataclass(frozen=True)
+class RemoteBackendConfig:
+    """Configuration for an OpenAI-compatible unmanaged backend."""
+
+    url: str
+    alt_urls: tuple[str, ...] = ()
+    slots: int = 1
+    probe_model: str = ""
+    auth_command: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class LaplacedConfig:
     """Validated daemon configuration.
 
@@ -54,6 +65,8 @@ class LaplacedConfig:
     model_context: Mapping[str, int] = field(default_factory=dict)
     model_footprint_mb: Mapping[str, int] = field(default_factory=dict)
     model_parallel: Mapping[str, int] = field(default_factory=dict)
+    backends: Mapping[str, RemoteBackendConfig] = field(default_factory=dict)
+    placement: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
     def budget_mb_or_none(self) -> int | None:
         """Broker budget: None triggers auto-detection, a positive value pins it."""
@@ -111,6 +124,8 @@ class LaplacedConfig:
         model_parallel = _coerce_int_map(
             raw.pop("model_parallel", None), "model_parallel"
         )
+        backends = _coerce_backends(raw.pop("backends", None))
+        placement = _coerce_placement(raw.pop("placement", None), backends)
         for model_id, parallel in model_parallel.items():
             if parallel <= 0:
                 raise ValueError(
@@ -142,6 +157,8 @@ class LaplacedConfig:
             model_context=model_context,
             model_footprint_mb=model_footprint_mb,
             model_parallel=model_parallel,
+            backends=backends,
+            placement=placement,
             **kwargs,
         )
 
@@ -164,6 +181,98 @@ def _coerce_int_map(value: Mapping | None, label: str) -> dict[str, int]:
                 f"laplaced config: [{label}] value for {key!r} must be an integer, got {raw!r}"
             )
         result[str(key)] = raw
+    return result
+
+
+def _coerce_backends(value: Mapping | None) -> dict[str, RemoteBackendConfig]:
+    if not value:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ValueError("laplaced config: [backends] must be a table")
+    result: dict[str, RemoteBackendConfig] = {}
+    for raw_name, raw_backend in value.items():
+        name = str(raw_name)
+        if name == "axis":
+            raise ValueError("laplaced config: backend name 'axis' is reserved")
+        if not isinstance(raw_backend, Mapping):
+            raise ValueError(f"laplaced config: [backends.{name}] must be a table")
+        unknown = set(raw_backend) - {
+            "url", "alt_urls", "slots", "probe_model", "auth_command"
+        }
+        if unknown:
+            raise ValueError(
+                f"laplaced config: [backends.{name}] has unknown keys {sorted(unknown)}"
+            )
+        url = raw_backend.get("url")
+        probe_model = raw_backend.get("probe_model")
+        alt_urls = raw_backend.get("alt_urls", ())
+        slots = raw_backend.get("slots", 1)
+        auth_command = raw_backend.get("auth_command", ())
+        if not isinstance(url, str) or not url:
+            raise ValueError(f"laplaced config: [backends.{name}].url must be a string")
+        if not isinstance(probe_model, str) or not probe_model:
+            raise ValueError(
+                f"laplaced config: [backends.{name}].probe_model must be a string"
+            )
+        if (
+            not isinstance(alt_urls, (list, tuple))
+            or not all(isinstance(item, str) and item for item in alt_urls)
+        ):
+            raise ValueError(
+                f"laplaced config: [backends.{name}].alt_urls must be a string list"
+            )
+        if isinstance(slots, bool) or not isinstance(slots, int) or slots <= 0:
+            raise ValueError(
+                f"laplaced config: [backends.{name}].slots must be a positive integer"
+            )
+        if (
+            not isinstance(auth_command, (list, tuple))
+            or not auth_command
+            or not all(isinstance(item, str) and item for item in auth_command)
+        ):
+            # Never include the command or its arguments in an exception.
+            raise ValueError(
+                f"laplaced config: [backends.{name}].auth_command must be a non-empty argv list"
+            )
+        result[name] = RemoteBackendConfig(
+            url=url.rstrip("/"),
+            alt_urls=tuple(item.rstrip("/") for item in alt_urls),
+            slots=slots,
+            probe_model=probe_model,
+            auth_command=tuple(auth_command),
+        )
+    return result
+
+
+def _coerce_placement(
+    value: Mapping | None,
+    backends: Mapping[str, RemoteBackendConfig],
+) -> dict[str, tuple[str, ...]]:
+    if not value:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ValueError("laplaced config: [placement] must be a table")
+    result: dict[str, tuple[str, ...]] = {}
+    for raw_key, raw_names in value.items():
+        key = str(raw_key)
+        if ":" not in key:
+            raise ValueError(
+                f"laplaced config: placement key {key!r} must be '<origin>:<model>'"
+            )
+        if (
+            not isinstance(raw_names, (list, tuple))
+            or not raw_names
+            or not all(isinstance(name, str) and name for name in raw_names)
+        ):
+            raise ValueError(
+                f"laplaced config: placement {key!r} must be a non-empty backend list"
+            )
+        missing = [name for name in raw_names if name != "axis" and name not in backends]
+        if missing:
+            raise ValueError(
+                f"laplaced config: placement {key!r} names unknown backends {missing}"
+            )
+        result[key] = tuple(raw_names)
     return result
 
 
