@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 
@@ -166,6 +167,46 @@ class _CoordinatedAdapter(FakeAdapter):
             await self.a_proceed.wait()
             raise RuntimeError("simulated load failure for A")
         await super().ensure_loaded(model_id, context_length)
+
+
+class _BlockingLoadAdapter(FakeAdapter):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.load_started = asyncio.Event()
+        self.finish_load = asyncio.Event()
+
+    async def ensure_loaded(self, model_id, context_length):
+        self.load_started.set()
+        await self.finish_load.wait()
+        await super().ensure_loaded(model_id, context_length)
+
+
+@pytest.mark.asyncio
+async def test_sweep_does_not_reap_model_while_load_is_in_progress():
+    adapter = _resident_adapter(_BlockingLoadAdapter)
+    reaper = Reaper(adapter)
+    broker = ContentionBroker(adapter, reaper, budget_mb=90000)
+    reaper.mark_managed(_MODEL)
+    reaper._last_used[_MODEL] = time.monotonic() - 3600.0
+
+    async def load_model():
+        async with govern(
+            broker, reaper, adapter,
+            model=_MODEL, ctx=131072, tier="interactive", fail_open=False,
+        ):
+            pass
+
+    loading = asyncio.create_task(load_model())
+    try:
+        await asyncio.wait_for(adapter.load_started.wait(), timeout=2.0)
+        # Prove the explicit load pin protects even a load longer than its TTL.
+        reaper._last_used[_MODEL] = time.monotonic() - 3600.0
+        await reaper.sweep_loaded()
+        assert adapter.force_unload_calls == []
+        assert not loading.done()
+    finally:
+        adapter.finish_load.set()
+        await loading
 
 
 @pytest.mark.asyncio

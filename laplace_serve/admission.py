@@ -83,7 +83,11 @@ async def govern(
     try:
         if first_touch:
             reaper.mark_managed(model)
-        await adapter.ensure_loaded(model, ctx)
+        reaper.start_loading(model)
+        try:
+            await adapter.ensure_loaded(model, ctx)
+        finally:
+            reaper.finish_loading(model)
         reaper.acquire(model)
         acquired = True
     except BaseException as exc:  # noqa: BLE001 - covers cancellation too

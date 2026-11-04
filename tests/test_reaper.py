@@ -58,6 +58,18 @@ def test_model_ttl_boundaries():
     assert _MEDIUM_MODEL_BYTES == 15 * _GIB
 
 
+def test_start_loading_does_not_leak_pin_when_touch_fails(monkeypatch):
+    reaper, _adapter = _reaper()
+
+    def fail_touch(_model_id):
+        raise RuntimeError("touch failed")
+
+    monkeypatch.setattr(reaper, "touch", fail_touch)
+    with pytest.raises(RuntimeError, match="touch failed"):
+        reaper.start_loading("model/a")
+    assert reaper._loading == {}
+
+
 @pytest.mark.asyncio
 async def test_sweep_evicts_big_model_after_ttl():
     reaper, adapter = _reaper(loaded=[loaded_model("big/model", size_bytes=31 * _GIB)])

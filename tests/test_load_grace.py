@@ -53,7 +53,7 @@ async def test_timeout_repeated_admissions_recover_after_grace(clock):
 
 
 @pytest.mark.asyncio
-async def test_grace_blocks_other_cold_load_but_resident_admits(clock):
+async def test_timeout_grace_blocks_other_cold_load_but_resident_admits(clock):
     rt = timeout_runtime(clock)
     rt.rows = [resident('already-resident')]
     with pytest.raises(ModelLoadError):
