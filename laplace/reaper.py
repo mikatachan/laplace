@@ -73,8 +73,8 @@ class Reaper:
         if not model_id:
             return
         base_id = self.adapter.base_id(model_id)
-        self._loading[base_id] = self._loading.get(base_id, 0) + 1
         self.touch(model_id)
+        self._loading[base_id] = self._loading.get(base_id, 0) + 1
 
     def finish_loading(self, model_id: str) -> None:
         """Release a load pin and protect the just-loaded model for a full TTL."""
