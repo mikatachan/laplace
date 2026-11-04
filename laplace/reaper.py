@@ -33,6 +33,7 @@ class Reaper:
         self._last_used: dict[str, float] = {}
         self._pending: dict[str, asyncio.Task] = {}
         self._in_flight: dict[str, int] = {}
+        self._loading: dict[str, int] = {}
         self._base_index: dict[str, set[str]] = {}
         self._managed: set[str] = set()
         self._loaded_size_bytes: dict[str, int] = {}
@@ -67,6 +68,26 @@ class Reaper:
         if task and not task.done():
             task.cancel()
 
+    def start_loading(self, model_id: str) -> None:
+        """Pin and touch a model while an admission is making it resident."""
+        if not model_id:
+            return
+        base_id = self.adapter.base_id(model_id)
+        self._loading[base_id] = self._loading.get(base_id, 0) + 1
+        self.touch(model_id)
+
+    def finish_loading(self, model_id: str) -> None:
+        """Release a load pin and protect the just-loaded model for a full TTL."""
+        if not model_id:
+            return
+        base_id = self.adapter.base_id(model_id)
+        remaining = self._loading.get(base_id, 0) - 1
+        if remaining > 0:
+            self._loading[base_id] = remaining
+        else:
+            self._loading.pop(base_id, None)
+        self.touch(model_id)
+
     def release(self, model_id: str) -> None:
         if not model_id:
             return
@@ -98,6 +119,9 @@ class Reaper:
         last_use = self._last_used.get(model_id, 0.0)
         elapsed = time.monotonic() - last_use
         if elapsed < self._delay:
+            self._pending[model_id] = asyncio.create_task(self._delayed_unload(model_id))
+            return
+        if self._is_loading(model_id):
             self._pending[model_id] = asyncio.create_task(self._delayed_unload(model_id))
             return
         if self._in_flight.get(model_id, 0) > 0 or self._in_flight.get(self.adapter.base_id(model_id), 0) > 0:
@@ -154,6 +178,7 @@ class Reaper:
             if model_id
             and self._in_flight.get(model_id, 0) == 0
             and self._in_flight.get(self.adapter.base_id(model_id), 0) == 0
+            and not self._is_loading(model_id)
             and not self._is_keep_loaded(model_id)
             and not self._is_external(model_id)
         ]
@@ -173,6 +198,8 @@ class Reaper:
             if len(instances) < 2:
                 continue
             if self._is_keep_loaded(base_id):
+                continue
+            if self._is_loading(base_id):
                 continue
             in_flight_instances = [mid for mid in instances if self._in_flight.get(mid, 0) > 0]
             if in_flight_instances:
@@ -283,6 +310,8 @@ class Reaper:
                     external_to_unload.append((model_id, idle_secs))
                 continue
             base_id = self.adapter.base_id(model_id)
+            if self._is_loading(base_id):
+                continue
             if self._in_flight.get(base_id, 0) > 0 and model_id in self._base_index.get(base_id, {model_id}):
                 continue
             if self._in_flight.get(model_id, 0) > 0:
@@ -487,6 +516,9 @@ class Reaper:
         if self._in_flight.get(model_id, 0) > 0 or self._in_flight.get(base_id, 0) > 0:
             return False
         return True
+
+    def _is_loading(self, model_id: str) -> bool:
+        return self._loading.get(self.adapter.base_id(model_id), 0) > 0
 
     def _resolve_acquire_model_id(self, model_id: str) -> str:
         base_id = self.adapter.base_id(model_id)
