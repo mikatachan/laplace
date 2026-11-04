@@ -181,7 +181,7 @@ class LMStudioAdapter:
             if failure:
                 raise ModelLoadError(failure)
             keys = await self._catalog_keys()
-            self._reconcile_uncertain(before, keys)
+            self._reconcile_uncertain(base, before, keys)
             if model_id not in keys:
                 closest = difflib.get_close_matches(model_id, sorted(keys), n=1, cutoff=0)
                 message = (
@@ -259,12 +259,16 @@ class LMStudioAdapter:
         active = [duration for duration in remaining if duration > 0]
         return max(active, default=None)
 
-    def _reconcile_uncertain(self, entries: list[dict], catalog_keys: set[str]) -> None:
-        """Use the fresh locked snapshot before permitting any cold load."""
+    def _reconcile_uncertain(
+        self, requested_base: str, entries: list[dict], catalog_keys: set[str]
+    ) -> None:
+        """Reconcile visible loads, globally guarding only client timeouts."""
         for base, pending in list(self._load_uncertain.items()):
             if any(self._matches(entry, base) for entry in entries):
                 # Visible instances are accounted for by the broker's inventory.
                 self._clear_load_state(base)
+                continue
+            if base != requested_base and pending.reason != "timeout":
                 continue
             deadline = pending.started_at + pending.window_s
             if time.monotonic() < deadline:
@@ -279,7 +283,10 @@ class LMStudioAdapter:
             possible = [
                 entry for entry in entries
                 if self._entry_identifier(entry) not in pending.previous
-                and not any(self._matches(entry, key) for key in known_keys - {base})
+                and not any(
+                    self._matches(entry, key)
+                    for key in known_keys - {base}
+                )
             ]
             if possible:
                 message = (
@@ -415,9 +422,10 @@ class LMStudioAdapter:
         except Exception as exc:
             raise ModelLoadError(f"lmstudio cannot validate catalog keys: {exc}") from exc
 
-    async def force_unload(self, model_id: str) -> bool:
+    async def force_unload(self, model_id: str, *, reason: str = "direct") -> bool:
         if not model_id:
             return False
+        log.info("lmstudio: unload requested model=%s reason=%s", model_id, reason)
         base = self.base_id(model_id)
         for attempt in range(2):
             try:

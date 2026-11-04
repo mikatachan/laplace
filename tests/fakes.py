@@ -55,7 +55,7 @@ class FakeAdapter:
     def guard_window_remaining_s(self) -> float | None:
         return None
 
-    async def force_unload(self, model_id: str) -> bool:
+    async def force_unload(self, model_id: str, *, reason: str = "direct") -> bool:
         self.force_unload_calls.append(model_id)
         outcomes = self.unload_outcomes.get(model_id)
         if outcomes:

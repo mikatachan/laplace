@@ -115,7 +115,36 @@ async def test_definite_failure_without_new_instance_can_retry(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_uncertain_model_does_not_block_unrelated_cold_load():
+async def test_rc_uncertain_model_does_not_block_unrelated_cold_load():
+    rt = Runtime()
+    rt.fail_load = True
+    with pytest.raises(ModelLoadError):
+        await rt.adapter.ensure_loaded(A, 4096)
+    rt.fail_load = False
+    await rt.adapter.ensure_loaded(B, 4096)
+    assert rt.loads == [A, B]
+
+
+@pytest.mark.asyncio
+async def test_verify_uncertain_model_does_not_block_unrelated_cold_load():
+    rt = Runtime()
+    original = rt.run
+
+    async def run(args, timeout):
+        if args[0] == 'load' and args[1] == A:
+            rt.loads.append(args[1])
+            return 0, '', ''
+        return await original(args, timeout)
+
+    rt.adapter._run = run
+    with pytest.raises(ModelLoadError):
+        await rt.adapter.ensure_loaded(A, 4096)
+    await rt.adapter.ensure_loaded(B, 4096)
+    assert rt.loads == [A, B]
+
+
+@pytest.mark.asyncio
+async def test_visible_model_clears_other_stale_uncertain_entry():
     rt = Runtime()
     rt.flaky_ps = True
     with pytest.raises(ModelLoadError):
