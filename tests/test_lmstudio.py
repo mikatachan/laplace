@@ -174,3 +174,20 @@ async def test_ensure_loaded_raises_when_model_never_appears():
     with pytest.raises(ModelLoadError, match="did not become resident"):
         await adapter.ensure_loaded("some/model", 4096)
     assert calls["ps"] == 3  # fast path, locked recheck, post-load verification
+
+
+@pytest.mark.asyncio
+async def test_force_unload_logs_model_and_reason_at_info(caplog):
+    adapter = LMStudioAdapter(unload_verify_delay_s=0.0)
+
+    async def fake_run(args, timeout):
+        if args[0] == "unload":
+            return (0, "ignored payload", "")
+        return (0, "[]", "")
+
+    adapter._run = fake_run
+    with caplog.at_level(logging.INFO, logger="laplace.adapters.lmstudio"):
+        assert await adapter.force_unload("some/model", reason="reaper:test") is True
+    assert [record.message for record in caplog.records] == [
+        "lmstudio: unload requested model=some/model reason=reaper:test"
+    ]
