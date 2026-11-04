@@ -262,50 +262,50 @@ class LMStudioAdapter:
     def _reconcile_uncertain(
         self, requested_base: str, entries: list[dict], catalog_keys: set[str]
     ) -> None:
-        """Reconcile uncertainty only for the model about to be cold-loaded."""
-        pending = self._load_uncertain.get(requested_base)
-        if pending is None:
-            return
-        if any(self._matches(entry, requested_base) for entry in entries):
-            # Visible instances are accounted for by the broker's inventory.
-            self._clear_load_state(requested_base)
-            return
-        deadline = pending.started_at + pending.window_s
-        if time.monotonic() < deadline:
-            raise ModelLoadError(
-                f"lmstudio load outcome unresolved for requested {requested_base}; "
-                f"cold loads blocked during {pending.reason} window "
-                f"({pending.window_s:g}s)"
+        """Reconcile visible loads, globally guarding only client timeouts."""
+        for base, pending in list(self._load_uncertain.items()):
+            if any(self._matches(entry, base) for entry in entries):
+                # Visible instances are accounted for by the broker's inventory.
+                self._clear_load_state(base)
+                continue
+            if base != requested_base and pending.reason != "timeout":
+                continue
+            deadline = pending.started_at + pending.window_s
+            if time.monotonic() < deadline:
+                raise ModelLoadError(
+                    f"lmstudio load outcome unresolved for requested {base}; "
+                    f"cold loads blocked during {pending.reason} window "
+                    f"({pending.window_s:g}s)"
+                )
+            # A known other catalog model is not evidence of a fuzzy result.
+            # Unknown new identities cannot safely be attributed or ignored.
+            known_keys = catalog_keys | pending.catalog_keys
+            possible = [
+                entry for entry in entries
+                if self._entry_identifier(entry) not in pending.previous
+                and not any(
+                    self._matches(entry, key)
+                    for key in known_keys - {base}
+                )
+            ]
+            if possible:
+                message = (
+                    f"lmstudio load outcome unresolved for requested {base}; "
+                    f"new unidentified instances={[self._entry_identifier(e) for e in possible]}; "
+                    "operator reconciliation required"
+                )
+                if not pending.wedge_logged:
+                    log.error("%s", message)
+                    pending.wedge_logged = True
+                raise ModelLoadError(message)
+            log.error(
+                "lmstudio uncertain load window expired model=%s reason=%s window=%gs; "
+                "fresh inventory has no new matching instance; allowing retry",
+                base,
+                pending.reason,
+                pending.window_s,
             )
-        # A known other catalog model is not evidence of a fuzzy result.
-        # Unknown new identities cannot safely be attributed or ignored.
-        known_keys = catalog_keys | pending.catalog_keys
-        possible = [
-            entry for entry in entries
-            if self._entry_identifier(entry) not in pending.previous
-            and not any(
-                self._matches(entry, key)
-                for key in known_keys - {requested_base}
-            )
-        ]
-        if possible:
-            message = (
-                f"lmstudio load outcome unresolved for requested {requested_base}; "
-                f"new unidentified instances={[self._entry_identifier(e) for e in possible]}; "
-                "operator reconciliation required"
-            )
-            if not pending.wedge_logged:
-                log.error("%s", message)
-                pending.wedge_logged = True
-            raise ModelLoadError(message)
-        log.error(
-            "lmstudio uncertain load window expired model=%s reason=%s window=%gs; "
-            "fresh inventory has no new matching instance; allowing retry",
-            requested_base,
-            pending.reason,
-            pending.window_s,
-        )
-        self._clear_load_state(requested_base)
+            self._clear_load_state(base)
 
     def _clear_load_state(self, base: str) -> None:
         self._load_uncertain.pop(base, None)

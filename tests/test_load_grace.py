@@ -53,19 +53,18 @@ async def test_timeout_repeated_admissions_recover_after_grace(clock):
 
 
 @pytest.mark.asyncio
-async def test_grace_blocks_failed_model_but_allows_other_cold_load(clock):
+async def test_timeout_grace_blocks_other_cold_load_but_resident_admits(clock):
     rt = timeout_runtime(clock)
     rt.rows = [resident('already-resident')]
     with pytest.raises(ModelLoadError):
         await rt.adapter.ensure_loaded(A, 4096)
     await rt.adapter.ensure_loaded('already-resident', 4096)
+    with pytest.raises(ModelLoadError, match='unresolved'):
+        await rt.adapter.ensure_loaded(B, 4096)
+    assert rt.loads == [A]
+    clock.now = 200
     await rt.adapter.ensure_loaded(B, 4096)
     assert rt.loads == [A, B]
-    with pytest.raises(ModelLoadError, match='unresolved'):
-        await rt.adapter.ensure_loaded(A, 4096)
-    clock.now = 200
-    await rt.adapter.ensure_loaded(A, 4096)
-    assert rt.loads == [A, B, A]
 
 
 @pytest.mark.asyncio
