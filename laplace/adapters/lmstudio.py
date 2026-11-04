@@ -415,9 +415,10 @@ class LMStudioAdapter:
         except Exception as exc:
             raise ModelLoadError(f"lmstudio cannot validate catalog keys: {exc}") from exc
 
-    async def force_unload(self, model_id: str) -> bool:
+    async def force_unload(self, model_id: str, *, reason: str = "direct") -> bool:
         if not model_id:
             return False
+        log.info("lmstudio: unload requested model=%s reason=%s", model_id, reason)
         base = self.base_id(model_id)
         for attempt in range(2):
             try:

@@ -128,7 +128,7 @@ class Reaper:
             self._pending[model_id] = asyncio.create_task(self._delayed_unload(model_id))
             return
         self._pending.pop(model_id, None)
-        await self.adapter.force_unload(model_id)
+        await self.adapter.force_unload(model_id, reason="reaper:idle-delay")
 
     @property
     def pending_unloads(self) -> list[str]:
@@ -211,7 +211,7 @@ class Reaper:
                     continue
                 if self._in_flight.get(model_id, 0) > 0:
                     continue
-                unloaded = await self.adapter.force_unload(model_id)
+                unloaded = await self.adapter.force_unload(model_id, reason="reaper:duplicate")
                 if unloaded:
                     reaped.append(model_id)
         return reaped
@@ -329,7 +329,7 @@ class Reaper:
             size_bytes = self._loaded_size_bytes.get(model_id) or self._loaded_size_bytes.get(
                 self.adapter.base_id(model_id)
             )
-            unloaded = await self.adapter.force_unload(model_id)
+            unloaded = await self.adapter.force_unload(model_id, reason="reaper:managed-idle-sweep")
             if not unloaded:
                 continue
             unloaded_count += 1
@@ -365,7 +365,7 @@ class Reaper:
             size_bytes = self._loaded_size_bytes.get(model_id) or self._loaded_size_bytes.get(
                 self.adapter.base_id(model_id)
             )
-            unloaded = await self.adapter.force_unload(model_id)
+            unloaded = await self.adapter.force_unload(model_id, reason="reaper:external-idle-sweep")
             self._ext_idle_sweeps.pop(model_id, None)
             self._ext_last_used_seen.pop(model_id, None)
             if not unloaded:
@@ -406,7 +406,7 @@ class Reaper:
             size_bytes = self._loaded_size_bytes.get(victim) or self._loaded_size_bytes.get(
                 self.adapter.base_id(victim)
             )
-            unloaded = await self.adapter.force_unload(victim)
+            unloaded = await self.adapter.force_unload(victim, reason="reaper:request-free")
             if not unloaded:
                 continue
             if size_bytes:

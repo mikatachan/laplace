@@ -40,7 +40,7 @@ class InferenceAdapter(Protocol):
     def guard_window_remaining_s(self) -> float | None:
         """Return the active uncertain-load guard duration, if any."""
 
-    async def force_unload(self, model_id: str) -> bool:
+    async def force_unload(self, model_id: str, *, reason: str = "direct") -> bool:
         """Unload ``model_id`` and verify it is gone."""
 
     def base_id(self, model_id: str) -> str:
