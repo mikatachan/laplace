@@ -98,6 +98,8 @@ def _bearer_token(value: str | None) -> str | None:
 
 
 def _route_class(path: str) -> str:
+    if path.startswith("/ops/"):
+        return "operations"
     if path.endswith("/v1/models"):
         return "models"
     if path in {"/readyz", "/fleet/status"}:
