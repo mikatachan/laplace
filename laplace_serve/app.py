@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+from urllib.parse import unquote
 from typing import Awaitable, Callable, Optional
 
 import aiohttp
@@ -42,6 +43,8 @@ SESSION = web.AppKey("session", aiohttp.ClientSession)
 FLEET = web.AppKey("fleet", RemoteFleet)
 CALLER_AUTH = web.AppKey("caller_auth", Optional[CallerAuthenticator])
 READYZ_PS_CHECK = web.AppKey("readyz_ps_check", object)
+UPSTREAM_LISTENER_CHECK = web.AppKey("upstream_listener_check", object)
+CATALOG_CHECK = web.AppKey("catalog_check", object)
 STARTUP_VALIDATION_RETRY_TASK = web.AppKey(
     "startup_validation_retry_task", Optional[asyncio.Task]
 )
@@ -54,6 +57,8 @@ def build_app(
     reaper: Reaper,
     broker: ContentionBroker,
     readyz_ps_check: Callable[[], Awaitable[bool]] | None = None,
+    upstream_listener_check: Callable[[], Awaitable[bool]] | None = None,
+    catalog_check: Callable[[str], Awaitable[str]] | None = None,
 ) -> web.Application:
     config.validate_governed_rest_auth()
     app = web.Application()
@@ -66,6 +71,10 @@ def build_app(
         CallerAuthenticator(config.caller_verifiers) if config.governed_rest_auth else None
     )
     app[READYZ_PS_CHECK] = readyz_ps_check or (lambda: _lms_ps_ok(10.0))
+    app[UPSTREAM_LISTENER_CHECK] = upstream_listener_check or (
+        lambda: _upstream_listener_ok(2.0)
+    )
+    app[CATALOG_CHECK] = catalog_check or (lambda model: _lms_catalog_status(model, 10.0))
 
     app.on_startup.append(_on_startup)
     app.on_cleanup.append(_on_cleanup)
@@ -86,6 +95,10 @@ def build_app(
     app.router.add_get("/healthz", _healthz)
     app.router.add_get("/readyz", _readyz)
     app.router.add_get("/fleet/status", _fleet_status)
+    if config.governed_rest_auth:
+        app.router.add_get("/ops/upstream-listener", _upstream_listener)
+        app.router.add_get("/ops/upstream-api", _upstream_api)
+        app.router.add_get("/ops/catalog/{model:.*}", _catalog)
     return app
 
 
@@ -298,7 +311,11 @@ async def _readyz(request: web.Request) -> web.Response:
         return denied
     config = request.app[CONFIG]
     proxy = request.app[PROXY]
-    models_ok = await proxy.probe_models(timeout=5.0)
+    models_ok = (
+        await proxy.probe_api(timeout=5.0)
+        if config.governed_rest_auth
+        else await proxy.probe_models(timeout=5.0)
+    )
     ps_ok = await request.app[READYZ_PS_CHECK]()
     sweep_state = (
         request.app[REAPER].sweep_health(config.sweep_interval_s * 2)
@@ -309,7 +326,11 @@ async def _readyz(request: web.Request) -> web.Response:
         return web.json_response({"status": "ready", "reaper_sweep": sweep_state})
     reasons = []
     if not models_ok:
-        reasons.append("upstream /v1/models unreachable within 5s")
+        reasons.append(
+            "upstream API unavailable within 5s"
+            if config.governed_rest_auth
+            else "upstream /v1/models unreachable within 5s"
+        )
     if not ps_ok:
         reasons.append("lms ps not rc 0 within 10s")
     if sweep_state not in {"healthy", "disabled"}:
@@ -325,6 +346,41 @@ def _authenticate_status(request: web.Request) -> web.Response | None:
     if not config.governed_rest_auth:
         return None
     return request.app[CALLER_AUTH].authenticate(request, None)
+
+
+async def _upstream_listener(request: web.Request) -> web.Response:
+    denied = _authenticate_status(request)
+    if denied is not None:
+        return denied
+    if await request.app[UPSTREAM_LISTENER_CHECK]():
+        return web.json_response({"status": "listening"})
+    return web.json_response({"status": "not-listening"}, status=503)
+
+
+async def _upstream_api(request: web.Request) -> web.Response:
+    denied = _authenticate_status(request)
+    if denied is not None:
+        return denied
+    if await request.app[PROXY].probe_api(timeout=5.0):
+        return web.json_response({"status": "ready"})
+    return web.json_response({"status": "unavailable"}, status=503)
+
+
+async def _catalog(request: web.Request) -> web.Response:
+    denied = _authenticate_status(request)
+    if denied is not None:
+        return denied
+    model = unquote(request.match_info["model"])
+    if not model or len(model) > 300 or any(ord(char) < 0x20 for char in model):
+        return web.json_response({"error": "invalid_model"}, status=400)
+    status = await request.app[CATALOG_CHECK](model)
+    if status == "available":
+        return web.json_response({"status": status, "model": model})
+    if status == "missing":
+        return web.json_response({"status": status, "model": model}, status=404)
+    return web.json_response(
+        {"status": "unavailable", "reason": "control-plane"}, status=503
+    )
 
 
 def _upstream_path(request: web.Request) -> str:
@@ -388,3 +444,58 @@ async def _lms_ps_ok(timeout: float) -> bool:
             return False
         return proc.returncode == 0
     return False
+
+
+async def _upstream_listener_ok(timeout: float) -> bool:
+    writer = None
+    try:
+        _reader, writer = await asyncio.wait_for(
+            asyncio.open_connection("127.0.0.1", 1234), timeout=timeout
+        )
+        return True
+    except (OSError, asyncio.TimeoutError):
+        return False
+    finally:
+        if writer is not None:
+            writer.close()
+            await writer.wait_closed()
+
+
+async def _lms_catalog_status(model: str, timeout: float) -> str:
+    for cli in (os.path.expanduser(_DEFAULT_LMS_CANDIDATES[0]), _DEFAULT_LMS_CANDIDATES[1]):
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                cli,
+                "ls",
+                "--json",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            continue
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return "unavailable"
+        if proc.returncode != 0:
+            return "unavailable"
+        try:
+            entries = json.loads(stdout.decode() or "[]")
+        except (UnicodeDecodeError, ValueError):
+            return "unavailable"
+        if not isinstance(entries, list):
+            return "unavailable"
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            identifiers = (
+                entry.get("modelKey"),
+                entry.get("path"),
+                entry.get("identifier"),
+            )
+            if model in identifiers:
+                return "available"
+        return "missing"
+    return "unavailable"
