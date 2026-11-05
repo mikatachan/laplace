@@ -106,6 +106,41 @@ auth_command = ["credential-helper", "read", "shinobi"]
 Remote state and fixed reason codes are available at `GET /fleet/status`.
 Omitting `[placement]` performs no credential command, probe, or remote request.
 
+### Opt-in governed REST authentication
+
+Caller authentication and local-upstream credential injection are disabled by
+default. Merely installing or restarting this revision therefore preserves the
+existing routes and Authorization forwarding. Enforcement starts only when the
+top-level boolean below is explicitly present and true:
+
+```toml
+governed_rest_auth = true
+upstream_auth_command = ["credential-helper", "read", "axis.laplaced.upstream"]
+
+[origins]
+hermes = "interactive"
+bot = "interactive"
+default = "scheduled"
+
+[caller_verifiers]
+hermes = "sha256:<at-least-16-byte-salt-hex>:<sha256-digest-hex>"
+bot = "sha256:<at-least-16-byte-salt-hex>:<sha256-digest-hex>"
+```
+
+The operator-side provisioning helper must generate each verifier from a
+separate random bearer token without printing that token. Configuration must
+contain exactly one verifier for every non-default origin; raw caller tokens
+and the LM Studio key never belong in TOML. Enabling the flag without complete
+verifiers or a fixed-argv upstream helper fails startup.
+
+When enabled, only origin-prefixed inference and models routes exist. The
+bearer token must map to the path origin; missing/invalid credentials return a
+fixed 401 and cross-origin credentials return a fixed 403. `/readyz` and
+`/fleet/status` also require any configured caller token, while `/healthz`
+remains unauthenticated liveness. Laplaced strips the caller Authorization
+header and injects the helper-provided upstream credential. Bare `/v1/...`
+routes are absent.
+
 ## Prior art / where Laplace fits
 
 See the assessment in `docs/`. Closest adjacent tools: **llama-swap** (own-process idle TTL), **ConductorAPI** (multi-runtime budgets+priority, early-stage), **ollamaMQ** (Ollama request-priority proxy), **LocalAI** (LRU + idle watchdog). None do external-tenant-aware reaping.
