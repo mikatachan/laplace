@@ -48,6 +48,8 @@ class LaplacedConfig:
     bind: str = "127.0.0.1"
     port: int = 4242
     upstream: str = "http://127.0.0.1:1234"
+    governed_rest_auth: bool = False
+    upstream_auth_command: tuple[str, ...] = ()
     budget_mb: int = 0
     max_concurrent: int = 2
     admit_timeout_s: float = 120.0
@@ -62,6 +64,7 @@ class LaplacedConfig:
     log_backups: int = 5
     log_path: str = "~/.laplace/logs/laplaced.log"
     origins: Mapping[str, str] = field(default_factory=lambda: dict(_DEFAULT_ORIGINS))
+    caller_verifiers: Mapping[str, str] = field(default_factory=dict)
     model_context: Mapping[str, int] = field(default_factory=dict)
     model_footprint_mb: Mapping[str, int] = field(default_factory=dict)
     model_parallel: Mapping[str, int] = field(default_factory=dict)
@@ -112,11 +115,41 @@ class LaplacedConfig:
             )
         return model_id
 
+    def validate_governed_rest_auth(self) -> None:
+        """Reject incomplete opt-in auth configuration without exposing values."""
+        if not self.governed_rest_auth:
+            return
+        if not self.upstream_auth_command or not all(
+            isinstance(item, str) and item for item in self.upstream_auth_command
+        ):
+            raise ValueError(
+                "laplaced config: governed_rest_auth requires upstream_auth_command argv"
+            )
+        expected = set(self.origins) - {DEFAULT_ORIGIN}
+        configured = set(self.caller_verifiers)
+        if configured != expected:
+            raise ValueError(
+                "laplaced config: governed_rest_auth requires exactly one caller verifier "
+                "for each non-default origin"
+            )
+        from laplace_serve.auth import validate_verifier
+
+        for verifier in self.caller_verifiers.values():
+            validate_verifier(verifier)
+
     @classmethod
     def from_dict(cls, data: Mapping | None) -> "LaplacedConfig":
         raw = dict(data or {})
 
+        if "governed_rest_auth" in raw and not isinstance(
+            raw["governed_rest_auth"], bool
+        ):
+            raise ValueError("laplaced config: governed_rest_auth must be a boolean")
+
         origins = dict(raw.pop("origins", None) or dict(_DEFAULT_ORIGINS))
+        caller_verifiers = _coerce_string_map(
+            raw.pop("caller_verifiers", None), "caller_verifiers"
+        )
         model_context = _coerce_int_map(raw.pop("model_context", None), "model_context")
         model_footprint_mb = _coerce_int_map(
             raw.pop("model_footprint_mb", None), "model_footprint_mb"
@@ -151,9 +184,20 @@ class LaplacedConfig:
         kwargs = {key: value for key, value in raw.items() if key in known}
         if "keep_loaded" in kwargs and kwargs["keep_loaded"] is not None:
             kwargs["keep_loaded"] = tuple(kwargs["keep_loaded"])
+        if "upstream_auth_command" in kwargs:
+            command = kwargs["upstream_auth_command"]
+            if (
+                not isinstance(command, (list, tuple))
+                or not all(isinstance(item, str) and item for item in command)
+            ):
+                raise ValueError(
+                    "laplaced config: upstream_auth_command must be an argv list"
+                )
+            kwargs["upstream_auth_command"] = tuple(command)
 
-        return cls(
+        config = cls(
             origins=origins,
+            caller_verifiers=caller_verifiers,
             model_context=model_context,
             model_footprint_mb=model_footprint_mb,
             model_parallel=model_parallel,
@@ -161,6 +205,8 @@ class LaplacedConfig:
             placement=placement,
             **kwargs,
         )
+        config.validate_governed_rest_auth()
+        return config
 
     @classmethod
     def from_toml_file(cls, path: str) -> "LaplacedConfig":
@@ -182,6 +228,18 @@ def _coerce_int_map(value: Mapping | None, label: str) -> dict[str, int]:
             )
         result[str(key)] = raw
     return result
+
+
+def _coerce_string_map(value: Mapping | None, label: str) -> dict[str, str]:
+    if not value:
+        return {}
+    if not isinstance(value, Mapping) or not all(
+        isinstance(key, str) and key
+        and isinstance(item, str) and item
+        for key, item in value.items()
+    ):
+        raise ValueError(f"laplaced config: [{label}] must map strings to strings")
+    return dict(value)
 
 
 def _coerce_backends(value: Mapping | None) -> dict[str, RemoteBackendConfig]:

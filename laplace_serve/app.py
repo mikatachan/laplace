@@ -19,6 +19,7 @@ from laplace.reaper import Reaper
 
 from laplace_serve import origins
 from laplace_serve.admission import govern
+from laplace_serve.auth import CallerAuthenticator
 from laplace_serve.config import LaplacedConfig
 from laplace_serve.proxy import UpstreamProxy
 from laplace_serve.remote import RemoteFleet
@@ -39,6 +40,7 @@ BROKER = web.AppKey("broker", ContentionBroker)
 PROXY = web.AppKey("proxy", UpstreamProxy)
 SESSION = web.AppKey("session", aiohttp.ClientSession)
 FLEET = web.AppKey("fleet", RemoteFleet)
+CALLER_AUTH = web.AppKey("caller_auth", Optional[CallerAuthenticator])
 READYZ_PS_CHECK = web.AppKey("readyz_ps_check", object)
 STARTUP_VALIDATION_RETRY_TASK = web.AppKey(
     "startup_validation_retry_task", Optional[asyncio.Task]
@@ -53,12 +55,16 @@ def build_app(
     broker: ContentionBroker,
     readyz_ps_check: Callable[[], Awaitable[bool]] | None = None,
 ) -> web.Application:
+    config.validate_governed_rest_auth()
     app = web.Application()
     app[CONFIG] = config
     app[ADAPTER] = adapter
     app[REAPER] = reaper
     app[BROKER] = broker
     app[FLEET] = RemoteFleet(config.backends, config.placement)
+    app[CALLER_AUTH] = (
+        CallerAuthenticator(config.caller_verifiers) if config.governed_rest_auth else None
+    )
     app[READYZ_PS_CHECK] = readyz_ps_check or (lambda: _lms_ps_ok(10.0))
 
     app.on_startup.append(_on_startup)
@@ -68,13 +74,14 @@ def build_app(
     app.router.add_post("/{origin}/v1/completions", _governed)
     app.router.add_post("/{origin}/v1/responses", _governed)
     app.router.add_post("/{origin}/v1/embeddings", _governed)
-    app.router.add_post("/v1/chat/completions", _governed)
-    app.router.add_post("/v1/completions", _governed)
-    app.router.add_post("/v1/responses", _governed)
-    app.router.add_post("/v1/embeddings", _governed)
+    if not config.governed_rest_auth:
+        app.router.add_post("/v1/chat/completions", _governed)
+        app.router.add_post("/v1/completions", _governed)
+        app.router.add_post("/v1/responses", _governed)
+        app.router.add_post("/v1/embeddings", _governed)
+        app.router.add_get("/v1/{tail:.*}", _ungoverned)
 
-    app.router.add_get("/{origin}/v1/models", _ungoverned)
-    app.router.add_get("/v1/{tail:.*}", _ungoverned)
+    app.router.add_get("/{origin}/v1/models", _models)
 
     app.router.add_get("/healthz", _healthz)
     app.router.add_get("/readyz", _readyz)
@@ -108,7 +115,16 @@ async def _on_startup(app: web.Application) -> None:
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=30)
     session = aiohttp.ClientSession(auto_decompress=False, timeout=timeout)
     app[SESSION] = session
-    app[PROXY] = UpstreamProxy(session, config.upstream)
+    app[PROXY] = UpstreamProxy(
+        session,
+        config.upstream,
+        config.upstream_auth_command if config.governed_rest_auth else (),
+    )
+    try:
+        await app[PROXY].start()
+    except Exception:
+        await session.close()
+        raise
     await app[FLEET].start()
     if config.reaper_sweep:
         app[REAPER].start_sweep_loop(config.sweep_interval_s)
@@ -158,7 +174,14 @@ async def _on_cleanup(app: web.Application) -> None:
 
 async def _governed(request: web.Request) -> web.StreamResponse:
     config = request.app[CONFIG]
-    origin, tier = origins.resolve(request.match_info.get("origin"), request.headers, config)
+    path_origin = request.match_info.get("origin")
+    if config.governed_rest_auth:
+        denied = request.app[CALLER_AUTH].authenticate(request, path_origin)
+        if denied is not None:
+            return denied
+        origin, tier = path_origin, config.tier_for(path_origin)
+    else:
+        origin, tier = origins.resolve(path_origin, request.headers, config)
 
     body = await request.read()
     requested_model, stream = _extract_model_stream(body)
@@ -246,16 +269,33 @@ async def _ungoverned(request: web.Request) -> web.StreamResponse:
     return await request.app[PROXY].forward(request, _upstream_path(request), body)
 
 
+async def _models(request: web.Request) -> web.StreamResponse:
+    config = request.app[CONFIG]
+    if config.governed_rest_auth:
+        denied = request.app[CALLER_AUTH].authenticate(
+            request, request.match_info["origin"]
+        )
+        if denied is not None:
+            return denied
+    return await _ungoverned(request)
+
+
 async def _healthz(request: web.Request) -> web.Response:
     # Liveness only: the process is up and serving. No upstream calls.
     return web.json_response({"status": "ok"})
 
 
 async def _fleet_status(request: web.Request) -> web.Response:
+    denied = _authenticate_status(request)
+    if denied is not None:
+        return denied
     return web.json_response(request.app[FLEET].snapshot())
 
 
 async def _readyz(request: web.Request) -> web.Response:
+    denied = _authenticate_status(request)
+    if denied is not None:
+        return denied
     config = request.app[CONFIG]
     proxy = request.app[PROXY]
     models_ok = await proxy.probe_models(timeout=5.0)
@@ -278,6 +318,13 @@ async def _readyz(request: web.Request) -> web.Response:
         {"status": "not ready", "reason": "; ".join(reasons), "reaper_sweep": sweep_state},
         status=503,
     )
+
+
+def _authenticate_status(request: web.Request) -> web.Response | None:
+    config = request.app[CONFIG]
+    if not config.governed_rest_auth:
+        return None
+    return request.app[CALLER_AUTH].authenticate(request, None)
 
 
 def _upstream_path(request: web.Request) -> str:
