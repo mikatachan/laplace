@@ -149,6 +149,34 @@ class UpstreamProxy:
             log.warning("proxy: /v1/models probe failed: %s", exc)
             return False
 
+    async def probe_api(self, timeout: float = 5.0) -> bool:
+        """Require authenticated /v1/models success and the OpenAI list shape."""
+        if self._credential is None:
+            return False
+        for attempt in range(2):
+            try:
+                async with self._session.get(
+                    self._upstream + "/v1/models",
+                    headers={"Authorization": f"Bearer {self._credential}"},
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                ) as response:
+                    if response.status == 401 and attempt == 0:
+                        if not await self._refresh_credential():
+                            return False
+                        continue
+                    if response.status != 200:
+                        return False
+                    try:
+                        payload = await response.json(content_type=None)
+                    except (ValueError, aiohttp.ClientError):
+                        return False
+                    return isinstance(payload, dict) and isinstance(
+                        payload.get("data"), list
+                    )
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                return False
+        return False
+
 
 async def _relay(
     request: web.Request,

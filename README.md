@@ -141,6 +141,22 @@ remains unauthenticated liveness. Laplaced strips the caller Authorization
 header and injects the helper-provided upstream credential. Bare `/v1/...`
 routes are absent.
 
+When the same flag is enabled, three authenticated operational probes are
+also registered:
+
+- `GET /ops/upstream-listener` performs only a bounded TCP connect to the local
+  LM Studio REST port and reports whether it is listening.
+- `GET /ops/upstream-api` requires an authenticated `200` from `/v1/models`
+  with an OpenAI-compatible list shape.
+- `GET /ops/catalog/{model}` runs a bounded `lms ls --json` inventory and
+  distinguishes an available model, a missing model, and a control-plane
+  failure.
+
+The aggregate `/readyz` uses the strict API probe only in enabled mode. With
+the flag absent or false, these routes do not exist and the legacy readiness
+semantics—including treating any upstream HTTP response as reachability—remain
+unchanged.
+
 ## Prior art / where Laplace fits
 
 See the assessment in `docs/`. Closest adjacent tools: **llama-swap** (own-process idle TTL), **ConductorAPI** (multi-runtime budgets+priority, early-stage), **ollamaMQ** (Ollama request-priority proxy), **LocalAI** (LRU + idle watchdog). None do external-tenant-aware reaping.

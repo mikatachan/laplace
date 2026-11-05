@@ -43,6 +43,8 @@ async def make_harness(
     reaper: Reaper | None = None,
     broker: ContentionBroker | None = None,
     readyz_ps_check: Callable[[], Awaitable[bool]] | None = None,
+    upstream_listener_check: Callable[[], Awaitable[bool]] | None = None,
+    catalog_check: Callable[[str], Awaitable[str]] | None = None,
     upstream: str | None = None,
 ):
     upstream_server = TestServer(upstream_app)
@@ -62,6 +64,8 @@ async def make_harness(
         reaper=reaper,
         broker=broker,
         readyz_ps_check=readyz_ps_check,
+        upstream_listener_check=upstream_listener_check,
+        catalog_check=catalog_check,
     )
     client = TestClient(TestServer(app))
     await client.start_server()
