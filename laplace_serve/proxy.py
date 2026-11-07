@@ -8,6 +8,8 @@ import logging
 import aiohttp
 from aiohttp import web
 
+from laplace_serve.inflight import RECORD
+
 log = logging.getLogger(__name__)
 
 # Hop-by-hop headers are connection-scoped and must not be relayed end to end
@@ -198,12 +200,19 @@ async def relay_after_commit(
     # never buffered (streamed-header edge c). A non-200 upstream is relayed the
     # same way, status and body as-is (edge a).
     await response.prepare(request)
+    # Opt-in progress record (laplace_serve.inflight). Each chunk is observed
+    # only after it has been written, so the client stream is unchanged.
+    record = request.get(RECORD)
 
     try:
         if first_chunk:
             await response.write(first_chunk)
+            if record is not None:
+                record.observe(first_chunk)
         async for chunk in upstream_resp.content.iter_any():
             await response.write(chunk)
+            if record is not None:
+                record.observe(chunk)
     except (ConnectionResetError, asyncio.CancelledError):
         # Downstream client disconnected mid-stream. Abort the upstream request
         # rather than draining it (R7), then re-raise to unwind the handler.

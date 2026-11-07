@@ -181,3 +181,33 @@ def test_model_parallel_reaches_adapter_only_when_configured():
         LaplacedConfig.from_dict({"model_parallel": {"org/model": 1}})
     )
     assert custom._parallel_overrides == {"org/model": 1}
+
+
+def test_inflight_defaults_off():
+    config = LaplacedConfig.from_dict({})
+    assert config.inflight.origins == ()
+    assert config.inflight.tail_chars == 400
+
+
+def test_inflight_table_parses(tmp_path):
+    path = tmp_path / "laplaced.toml"
+    path.write_text('[inflight]\norigins = ["hermes"]\ntail_chars = 120\n')
+    config = LaplacedConfig.from_toml_file(str(path))
+    assert config.inflight.origins == ("hermes",)
+    assert config.inflight.tail_chars == 120
+
+
+@pytest.mark.parametrize(
+    ("table", "message"),
+    [
+        ("not-a-table", r"\[inflight\] must be a table"),
+        ({"origins": "hermes"}, r"\[inflight\]\.origins must be a string list"),
+        ({"origins": [""]}, r"\[inflight\]\.origins must be a string list"),
+        ({"tail_chars": 0}, r"\[inflight\]\.tail_chars must be a positive integer"),
+        ({"tail_chars": True}, r"\[inflight\]\.tail_chars must be a positive integer"),
+        ({"tail": 10}, r"\[inflight\] has unknown keys \['tail'\]"),
+    ],
+)
+def test_inflight_validation(table, message):
+    with pytest.raises(ValueError, match=message):
+        LaplacedConfig.from_dict({"inflight": table})
