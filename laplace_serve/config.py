@@ -38,6 +38,14 @@ class RemoteBackendConfig:
 
 
 @dataclass(frozen=True)
+class InflightConfig:
+    """Opt-in in-flight progress records. Empty ``origins`` keeps it off."""
+
+    origins: tuple[str, ...] = ()
+    tail_chars: int = 400
+
+
+@dataclass(frozen=True)
 class LaplacedConfig:
     """Validated daemon configuration.
 
@@ -70,6 +78,7 @@ class LaplacedConfig:
     model_parallel: Mapping[str, int] = field(default_factory=dict)
     backends: Mapping[str, RemoteBackendConfig] = field(default_factory=dict)
     placement: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    inflight: InflightConfig = field(default_factory=InflightConfig)
 
     def budget_mb_or_none(self) -> int | None:
         """Broker budget: None triggers auto-detection, a positive value pins it."""
@@ -159,6 +168,7 @@ class LaplacedConfig:
         )
         backends = _coerce_backends(raw.pop("backends", None))
         placement = _coerce_placement(raw.pop("placement", None), backends)
+        inflight = _coerce_inflight(raw.pop("inflight", None))
         for model_id, parallel in model_parallel.items():
             if parallel <= 0:
                 raise ValueError(
@@ -203,6 +213,7 @@ class LaplacedConfig:
             model_parallel=model_parallel,
             backends=backends,
             placement=placement,
+            inflight=inflight,
             **kwargs,
         )
         config.validate_governed_rest_auth()
@@ -332,6 +343,26 @@ def _coerce_placement(
             )
         result[key] = tuple(raw_names)
     return result
+
+
+def _coerce_inflight(value: Mapping | None) -> InflightConfig:
+    if value is None:
+        return InflightConfig()
+    if not isinstance(value, Mapping):
+        raise ValueError("laplaced config: [inflight] must be a table")
+    unknown = set(value) - {"origins", "tail_chars"}
+    if unknown:
+        raise ValueError(f"laplaced config: [inflight] has unknown keys {sorted(unknown)}")
+    origins = value.get("origins", ())
+    tail_chars = value.get("tail_chars", 400)
+    if (
+        not isinstance(origins, (list, tuple))
+        or not all(isinstance(item, str) and item for item in origins)
+    ):
+        raise ValueError("laplaced config: [inflight].origins must be a string list")
+    if isinstance(tail_chars, bool) or not isinstance(tail_chars, int) or tail_chars <= 0:
+        raise ValueError("laplaced config: [inflight].tail_chars must be a positive integer")
+    return InflightConfig(origins=tuple(origins), tail_chars=tail_chars)
 
 
 def missing_context_ids(roster_ids: Iterable[str], config: LaplacedConfig) -> list[str]:

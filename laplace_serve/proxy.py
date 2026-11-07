@@ -8,6 +8,8 @@ import logging
 import aiohttp
 from aiohttp import web
 
+from laplace_serve.inflight import RECORD, InflightRecord
+
 log = logging.getLogger(__name__)
 
 # Hop-by-hop headers are connection-scoped and must not be relayed end to end
@@ -198,12 +200,19 @@ async def relay_after_commit(
     # never buffered (streamed-header edge c). A non-200 upstream is relayed the
     # same way, status and body as-is (edge a).
     await response.prepare(request)
+    # Opt-in progress record (laplace_serve.inflight). Each chunk is observed
+    # only after it has been written, so the client stream is unchanged.
+    record = request.get(RECORD)
 
     try:
         if first_chunk:
             await response.write(first_chunk)
+            if record is not None:
+                record = _observe(record, first_chunk)
         async for chunk in upstream_resp.content.iter_any():
             await response.write(chunk)
+            if record is not None:
+                record = _observe(record, chunk)
     except (ConnectionResetError, asyncio.CancelledError):
         # Downstream client disconnected mid-stream. Abort the upstream request
         # rather than draining it (R7), then re-raise to unwind the handler.
@@ -223,6 +232,23 @@ async def relay_after_commit(
 
     await response.write_eof()
     return response
+
+
+def _observe(record: InflightRecord, chunk: bytes) -> InflightRecord | None:
+    """Feed a progress record; a failure there must never touch the stream.
+
+    On any Exception the record is marked failed and observation stops for this
+    request. BaseException (cancellation) still propagates. The log line names
+    only the exception type, never stream content.
+    """
+    try:
+        record.observe(chunk)
+    except Exception as exc:  # noqa: BLE001 - observation is best-effort
+        record.observer_failed = True
+        log.warning("inflight: progress observer failed (%s); stopped for this request",
+                    type(exc).__name__)
+        return None
+    return record
 
 
 def filter_request_headers(headers, *, strip_credentials: bool = False) -> dict[str, str]:
