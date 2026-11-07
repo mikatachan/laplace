@@ -238,10 +238,19 @@ class ContentionBroker:
             return None
         entries = [entry for entry in await self._adapter.list_loaded() if entry.id]
         resident = [entry.id for entry in entries]
-        if self._is_committed(model_id, resident):
-            # No new load: memory for this model is already resident or reserved.
+        covered = self._covered_by_existing(model_id, context_length, entries)
+        if covered == "admit":
+            # No new load: an instance at this context is resident or pending.
             self._reserve(model_id, context_length)
             return "admit"
+        if covered == "wait":
+            log.info(
+                "laplace.broker: load decision model=%s ctx=%s decision=queue "
+                "reason=pending-load-at-smaller-context",
+                model_id,
+                context_length,
+            )
+            return None
 
         cost = await self._adapter.load_cost(model_id, context_length)
         if cost is None:
@@ -297,7 +306,7 @@ class ContentionBroker:
         evictable_ids = set(self._reaper.evictable_models(resident))
         evictable = [
             entry for entry in entries
-            if entry.id in evictable_ids and not self._is_reserved(entry.id)
+            if entry.id in evictable_ids and not self._is_busy(entry)
         ]
         # Credit idle victims with weights + overhead only: KV they no longer
         # hold is not counted, so eviction is chosen only when it surely helps.
@@ -361,10 +370,37 @@ class ContentionBroker:
             return True
         if self._is_reserved(entry.id):
             return True
-        if entry.queued:
-            return True
-        # Unknown status is treated as busy: an external tenant may be generating.
-        return entry.status != "idle"
+        return Reaper.reported_busy(entry)
+
+    def _covered_by_existing(
+        self, model_id: str, context_length: int | None, entries: list[LoadedModel]
+    ) -> str | None:
+        """Whether a resident or pending instance already pays for this request.
+
+        ``admit``: one resident instance, or a pending load, at a context at
+        least as large. ``wait``: a pending load at a smaller or unknown
+        context, which this request must not ride on. ``None``: decide on cost.
+        Parallel is fixed per model by [model_parallel], so context is the only
+        per-request dimension.
+        """
+        matches = [entry for entry in entries if self._same_model(model_id, entry.id)]
+        if matches:
+            if len(matches) == 1 and (
+                context_length is None
+                or (matches[0].context_length or 0) >= context_length
+            ):
+                return "admit"
+            return None
+        pending = [
+            reserved for reserved in self._reserved if self._same_model(model_id, reserved)
+        ]
+        if not pending:
+            return None
+        if context_length is None or any(
+            (self._reserved_ctx.get(reserved) or 0) >= context_length for reserved in pending
+        ):
+            return "admit"
+        return "wait"
 
     def _reserve(self, model_id: str, context_length: int | None = None) -> None:
         self._reserved[model_id] = self._reserved.get(model_id, 0) + 1

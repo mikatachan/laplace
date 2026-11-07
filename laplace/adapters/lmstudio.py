@@ -244,18 +244,30 @@ class LMStudioAdapter:
     def _kv_specs(self, base: str, entry: dict | None) -> list[tuple[int, int | None]] | None:
         if base in self._kv_specs_cache:
             return self._kv_specs_cache[base]
-        path = entry.get("path") if entry else None
-        if not isinstance(path, str) or not path:
+        if not entry:
             return None
-        root = path if os.path.isabs(path) else os.path.join(self._models_dir, path)
-        if os.path.isfile(root):
-            root = os.path.dirname(root)
-        try:
-            with open(os.path.join(root, "config.json"), encoding="utf-8") as handle:
-                specs = kv_layer_specs(json.load(handle))
-        except (OSError, ValueError) as exc:
-            log.info("lmstudio: no architecture metadata for %s: %s", base, exc)
-            specs = None
+        # Hub models can report a ``path`` that is not the on-disk directory;
+        # try each identity LM Studio reports and use the first with a config.
+        candidates = [
+            entry.get(key) for key in ("indexedModelIdentifier", "path")
+            if isinstance(entry.get(key), str) and entry.get(key)
+        ]
+        if not candidates:
+            return None
+        specs = None
+        for candidate in candidates:
+            root = (
+                candidate if os.path.isabs(candidate)
+                else os.path.join(self._models_dir, candidate)
+            )
+            if os.path.isfile(root):
+                root = os.path.dirname(root)
+            try:
+                with open(os.path.join(root, "config.json"), encoding="utf-8") as handle:
+                    specs = kv_layer_specs(json.load(handle))
+                break
+            except (OSError, ValueError) as exc:
+                log.info("lmstudio: no architecture metadata for %s at %s: %s", base, root, exc)
         self._kv_specs_cache[base] = specs
         return specs
 
