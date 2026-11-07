@@ -383,6 +383,46 @@ async def test_lmstudio_load_cost_reads_catalog_size_and_config(tmp_path):
     assert await unpinned.load_cost("not/in-catalog", CTX) is None
 
 
+@pytest.mark.asyncio
+async def test_lmstudio_load_cost_resolves_hub_variant_directory(tmp_path):
+    # Reproduces `lms ls --json` for gemma-4-26b: path and indexedModelIdentifier
+    # are the hub id; the files live under the variant's real directory.
+    real = tmp_path / "lmstudio-community" / "gemma-4-26B-A4B-it-QAT-MLX-4bit"
+    real.mkdir(parents=True)
+    (real / "config.json").write_text(json.dumps(QWEN36_27B))
+    hub = {"modelKey": "google/gemma-4-26b-a4b-qat", "path": "google/gemma-4-26b-a4b-qat",
+           "indexedModelIdentifier": "google/gemma-4-26b-a4b-qat",
+           "variants": ["google/gemma-4-26b-a4b-qat@4bit"],
+           "selectedVariant": "google/gemma-4-26b-a4b-qat@4bit", "sizeBytes": 1024 * _MIB}
+    variants = [
+        {"modelKey": "google/gemma-4-26b-a4b-qat@8bit",
+         "indexedModelIdentifier": "google/gemma-4-26b-a4b-qat@other/Missing-8bit"},
+        {"modelKey": "google/gemma-4-26b-a4b-qat@4bit",
+         "indexedModelIdentifier": "google/gemma-4-26b-a4b-qat@"
+                                   "lmstudio-community/gemma-4-26B-A4B-it-QAT-MLX-4bit"},
+    ]
+
+    async def fake_run(args, timeout):
+        if args == ["ls", "--json"]:
+            return (0, json.dumps([hub]), "")
+        assert args == ["ls", "google/gemma-4-26b-a4b-qat", "--json"]
+        return (0, json.dumps(variants), "")
+
+    adapter = LMStudioAdapter(models_dir=str(tmp_path),
+                              parallel_overrides={"google/gemma-4-26b-a4b-qat": 1})
+    adapter._run = fake_run
+    cost = await adapter.load_cost("google/gemma-4-26b-a4b-qat", CTX)
+    assert "kv=no-architecture" not in cost.estimate
+    assert cost.kv_mb == 8192  # QWEN36_27B config at CTX, parallel 1
+
+    # Variant lookup yielding nothing falls back to the reported identities.
+    variants.clear()
+    fallback = LMStudioAdapter(models_dir=str(tmp_path),
+                               parallel_overrides={"google/gemma-4-26b-a4b-qat": 1})
+    fallback._run = fake_run
+    assert "kv=no-architecture" in (await fallback.load_cost("google/gemma-4-26b-a4b-qat", CTX)).estimate
+
+
 VM_STAT = """Mach Virtual Memory Statistics: (page size of 16384 bytes)
 Pages free:                                  {free}.
 Pages active:                                 {active}.
