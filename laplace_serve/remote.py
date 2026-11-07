@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from dataclasses import dataclass
 from typing import Mapping
@@ -13,6 +14,8 @@ from aiohttp import web
 
 from laplace_serve.config import RemoteBackendConfig
 from laplace_serve.proxy import filter_request_headers, relay_after_commit
+
+log = logging.getLogger(__name__)
 
 PROBE_INTERVAL_S = 120.0
 PROBE_TIMEOUT_S = 10.0
@@ -46,6 +49,15 @@ class RemoteBackend:
         self._session: aiohttp.ClientSession | None = None
         self._probe_task: asyncio.Task | None = None
         self._slots = asyncio.Semaphore(config.slots)
+
+    def _set_state(self, state: str, reason: str | None) -> None:
+        previous = self.state
+        self.state = state
+        self.reason = reason
+        if state != previous:
+            log.info(
+                "backend %s state %s->%s reason=%s", self.name, previous, state, reason
+            )
 
     async def start(self) -> None:
         if not self._active:
@@ -97,18 +109,15 @@ class RemoteBackend:
         credential = await self._run_auth_command()
         if credential is None:
             self._credential = None
-            self.state = "DISABLED"
-            self.reason = "no-credential"
+            self._set_state("DISABLED", "no-credential")
             return False
         if not _is_header_safe_token(credential):
             self._credential = None
-            self.state = "DISABLED"
-            self.reason = "bad-credential"
+            self._set_state("DISABLED", "bad-credential")
             return False
         self._credential = credential
         if self.state == "DISABLED":
-            self.state = "DOWN"
-            self.reason = "not-probed"
+            self._set_state("DOWN", "not-probed")
         return True
 
     async def _probe_loop(self, *, delay_first: bool = False) -> None:
@@ -186,8 +195,7 @@ class RemoteBackend:
         self.consecutive_successes += 1
         self.consecutive_failures = 0
         if self.consecutive_successes >= 2:
-            self.state = "UP"
-            self.reason = None
+            self._set_state("UP", None)
 
     def record_probe_failure(self, reason: str = "probe-failed") -> None:
         self.consecutive_failures += 1
@@ -195,16 +203,14 @@ class RemoteBackend:
         if self.state == "DISABLED":
             return
         if self.consecutive_failures >= 2:
-            self.state = "DOWN"
-            self.reason = reason
+            self._set_state("DOWN", reason)
 
     def record_request_failure(self, reason: str) -> None:
         self.consecutive_failures += 1
         self.consecutive_successes = 0
         if self.state == "DISABLED":
             return
-        self.state = "DOWN"
-        self.reason = reason
+        self._set_state("DOWN", reason)
 
     async def forward(
         self,
