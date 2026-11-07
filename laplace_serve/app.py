@@ -240,6 +240,12 @@ async def _route(
             request, _upstream_path(request), forwarded_body
         )
         if result.response is not None:
+            log.info(
+                "route origin=%s model=%s backend=%s reason=served",
+                origin,
+                model or "-",
+                backend_name,
+            )
             return result.response
         log.info(
             "route origin=%s model=%s backend=%s reason=fallback:%s",
