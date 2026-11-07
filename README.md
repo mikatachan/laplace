@@ -209,12 +209,27 @@ live_memory_admission = true
   window; linear-attention layers are skipped) x parallel (`[model_parallel]`).
   Overhead is 10% of weights.
 - **Headroom** is read from `vm_stat` at each decision: free + speculative +
-  inactive pages up to the file-backed count, minus compressor growth since the
-  previous reading, capped by the room left under `iogpu.wired_limit_mb`.
+  the inactive pages that are surely file-backed, minus compressor growth since
+  the previous reading, capped by the room left under `iogpu.wired_limit_mb`.
+  `vm_stat` reports inactive and file-backed as separate totals, so only their
+  guaranteed overlap is counted: `inactive + file-backed - (active + inactive +
+  speculative)`, floored at 0. Anonymous inactive pages need compression to
+  reclaim and are never counted.
 - **Reserved first**: the full KV a busy resident model can still grow to at
   its loaded context (busy = in flight through laplaced, or `lms ps` reports it
-  as not idle or as having queued requests), plus the full cost of admitted
-  loads that are not resident yet.
+  as not idle, with unknown status, or with queued requests), plus the full
+  cost of admitted loads that are not resident yet.
+- **Busy models are never evicted** on this path, whatever laplaced's own
+  refcount says.
+- **Context must be covered**: a request rides on a resident instance or a
+  pending load only when that instance's context is at least the request's.
+  A larger context than a pending load waits; a larger context than a resident
+  instance is a new cost decision.
+- **Architecture lookup**: `config.json` is found under the models directory via
+  the catalog entry's `indexedModelIdentifier`, then its `path`. Hub entries whose
+  path is not on disk fall back to the conservative KV estimate (256 KiB per
+  token per sequence, i.e. 32768 MiB at 131072 context), which can hold loads in
+  the queue; the log names it `kv=no-architecture`.
 
 If the cost does not fit, idle models are evicted when their weights would
 cover the shortfall. Freed memory is measured with `vm_stat`, not inferred
@@ -223,8 +238,8 @@ gets the usual 503. An unreadable `vm_stat` or an unknown cost also means
 wait, never load. Each decision logs one `load decision` line with every term;
 `basis=estimate(...)` names any term that was not derived from observed data
 (footprint-table weights, missing `config.json`, unpinned parallel, sized as 4).
-Requests for a model that is already resident do not need a new load and are
-admitted as before.
+Requests for a model already resident at a sufficient context do not need a
+new load and are admitted as before.
 
 ## Prior art / where Laplace fits
 

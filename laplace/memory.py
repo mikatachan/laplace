@@ -59,8 +59,13 @@ class VmStatHeadroom:
     """Callable returning live headroom in MB, or ``None`` when unreadable.
 
     Headroom is memory a new load can take without forcing compression or swap:
-    free + speculative pages + inactive pages up to the file-backed count
-    (anonymous inactive pages are reclaimed only by compressing them). Growth
+    free + speculative pages + inactive pages that are surely file-backed
+    (anonymous inactive pages are reclaimed only by compressing them).
+    vm_stat reports inactive and file-backed as separate totals over the same
+    pageable pages (active + inactive + speculative == file-backed + anonymous),
+    so their overlap is only bounded below:
+    inactive + file_backed - (active + inactive + speculative), floored at 0.
+    That lower bound is what is counted. Growth
     in compressor occupancy since the previous reading is subtracted as active
     pressure. When ``iogpu.wired_limit_mb`` is set, headroom is also capped by
     the room left under that limit, since model memory is GPU-wired.
@@ -79,8 +84,9 @@ class VmStatHeadroom:
             page = rows["page_size"]
             free = rows["Pages free"]
             speculative = rows.get("Pages speculative", 0)
+            active = rows["Pages active"]
             inactive = rows["Pages inactive"]
-            file_backed = rows.get("File-backed pages", inactive)
+            file_backed = rows.get("File-backed pages", 0)
             wired = rows["Pages wired down"]
             compressor = rows.get("Pages occupied by compressor", 0)
         except (KeyError, ValueError) as exc:
@@ -92,7 +98,9 @@ class VmStatHeadroom:
             growth = max(0, compressor - self._last_compressor_pages)
         self._last_compressor_pages = compressor
 
-        reclaimable = free + speculative + min(inactive, file_backed) - growth
+        pageable = active + inactive + speculative
+        clean_inactive = min(inactive, max(0, inactive + file_backed - pageable))
+        reclaimable = free + speculative + clean_inactive - growth
         headroom_mb = reclaimable * page // _MIB
 
         limit_text = await self._run(["sysctl", "-n", "iogpu.wired_limit_mb"])

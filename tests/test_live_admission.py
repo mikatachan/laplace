@@ -202,11 +202,72 @@ async def test_unreadable_headroom_fails_closed():
 
 @pytest.mark.asyncio
 async def test_resident_model_admits_without_probe():
-    adapter = CostAdapter(costs=COSTS, loaded=[loaded_model("bot/a", status="generating")])
+    adapter = CostAdapter(
+        costs=COSTS, loaded=[loaded_model("bot/a", status="generating", context_length=CTX)]
+    )
     probe = Probe(0)
     broker = ContentionBroker(adapter, Reaper(adapter), headroom_mb=probe, timeout_s=0.1)
     assert await broker.admit("bot/a", CTX) == "admit"
     assert probe.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_resident_at_smaller_context_is_a_cost_decision():
+    adapter = CostAdapter(
+        costs=COSTS, loaded=[loaded_model("bot/a", status="idle", context_length=65536)]
+    )
+    probe = Probe(0)
+    broker = ContentionBroker(adapter, Reaper(adapter), headroom_mb=probe, timeout_s=0.1)
+    assert await broker.admit("bot/a", CTX) == "backpressure"
+    assert probe.calls >= 1
+
+
+@pytest.mark.asyncio
+async def test_larger_context_does_not_ride_on_pending_smaller_reservation():
+    # Reviewer reproduction: a 64K admit reserved; a 131K admit of the same model
+    # returned admit with no second headroom read.
+    adapter = CostAdapter(costs=COSTS)
+    probe = Probe(35000)
+    broker = ContentionBroker(
+        adapter, Reaper(adapter), headroom_mb=probe, timeout_s=0.1, max_concurrent_lms=4
+    )
+    assert await broker.admit("bot/c", 65536) == "admit"
+    assert await broker.admit("bot/c", CTX) == "backpressure"
+    assert broker._reserved_ctx["bot/c"] == 65536
+    # A smaller context may share the pending load.
+    assert await broker.admit("bot/c", 32768) == "admit"
+    assert probe.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_live_eviction_skips_model_reported_generating():
+    # Reviewer reproduction: a managed resident with lms status "generating"
+    # and zero laplace refcount was evicted.
+    adapter = CostAdapter(
+        costs=COSTS,
+        loaded=[loaded_model("victim", size_bytes=16 * _GIB, status="generating",
+                             queued=0, context_length=CTX)],
+    )
+    adapter.costs["victim"] = _cost(16000, 16384)
+    reaper = Reaper(adapter)
+    reaper.acquire("victim")
+    reaper.release("victim")
+    assert "victim" in reaper.evictable_models(["victim"])
+    # 40000 - 16384 reserved KV leaves a 10368 MB shortfall that evicting it would cover.
+    broker = ContentionBroker(adapter, reaper, headroom_mb=Probe(40000), timeout_s=0.1)
+    requested: list[int] = []
+    real_request_free = reaper.request_free
+
+    async def record(needed_mb, priority=None, **kwargs):
+        requested.append(needed_mb)
+        return await real_request_free(needed_mb, priority, **kwargs)
+
+    reaper.request_free = record
+    assert await broker.admit("bot/c", CTX) == "backpressure"
+    assert requested == []  # the broker never counts a busy model as evictable
+    reaper.request_free = real_request_free
+    assert await reaper.request_free(10_000, headroom_mb=Probe(0)) is False
+    assert adapter.force_unload_calls == []
 
 
 @pytest.mark.asyncio
@@ -236,8 +297,8 @@ async def _async(value):
 async def test_request_free_credits_measured_headroom_not_file_size():
     def pool():
         adapter = FakeAdapter(loaded=[
-            loaded_model("a/old", size_bytes=10 * _GIB),
-            loaded_model("b/new", size_bytes=10 * _GIB),
+            loaded_model("a/old", size_bytes=10 * _GIB, status="idle", queued=0),
+            loaded_model("b/new", size_bytes=10 * _GIB, status="idle", queued=0),
         ])
         reaper = Reaper(adapter)
         for model_id in ("a/old", "b/new"):
@@ -309,6 +370,13 @@ async def test_lmstudio_load_cost_reads_catalog_size_and_config(tmp_path):
     assert embed.estimate == ("kv=no-architecture",)
     assert embed.kv_mb == 256 * 1024 * 2048 // _MIB
 
+    # Hub entries whose path is not on disk resolve via indexedModelIdentifier.
+    catalog.append({"modelKey": "google/gemma", "path": "google/gemma",
+                    "indexedModelIdentifier": "mlx-community/Qwen3.6-27B-4bit",
+                    "sizeBytes": 1024 * _MIB})
+    hub = await adapter.load_cost("google/gemma", CTX)
+    assert "kv=no-architecture" not in hub.estimate
+
     unpinned = LMStudioAdapter(models_dir=str(tmp_path))
     unpinned._run = fake_run
     assert "parallel=unconfigured(4)" in (await unpinned.load_cost("qwen3.6-27b", CTX)).estimate
@@ -317,9 +385,9 @@ async def test_lmstudio_load_cost_reads_catalog_size_and_config(tmp_path):
 
 VM_STAT = """Mach Virtual Memory Statistics: (page size of 16384 bytes)
 Pages free:                                  {free}.
-Pages active:                                 737718.
+Pages active:                                 {active}.
 Pages inactive:                               {inactive}.
-Pages speculative:                             64.
+Pages speculative:                             {speculative}.
 Pages wired down:                            {wired}.
 "Translation faults":                    18296142287.
 File-backed pages:                            {file}.
@@ -327,8 +395,11 @@ Pages occupied by compressor:                  {compressor}.
 """
 
 
-def _vm(free=1024, inactive=512, file=256, wired=0, compressor=0):
-    return VM_STAT.format(free=free, inactive=inactive, file=file, wired=wired, compressor=compressor)
+def _vm(free=1024, active=0, inactive=512, speculative=64, file=256, wired=0, compressor=0):
+    return VM_STAT.format(
+        free=free, active=active, inactive=inactive, speculative=speculative,
+        file=file, wired=wired, compressor=compressor,
+    )
 
 
 def test_parse_vm_stat():
@@ -339,8 +410,11 @@ def test_parse_vm_stat():
 
 @pytest.mark.asyncio
 async def test_vm_stat_headroom_counts_file_backed_inactive_and_compressor_growth():
+    # active 100 + inactive 512 + speculative 64 = 676 pageable; file-backed 600
+    # => at least 512 + 600 - 676 = 436 inactive pages are file-backed.
+    state = dict(active=100, inactive=512, speculative=64, file=600)
     outputs = {
-        "vm_stat": [_vm(compressor=100), _vm(compressor=100 + 640)],
+        "vm_stat": [_vm(compressor=100, **state), _vm(compressor=100 + 640, **state)],
         "sysctl": ["0\n", "0\n"],
     }
 
@@ -348,10 +422,20 @@ async def test_vm_stat_headroom_counts_file_backed_inactive_and_compressor_growt
         return outputs[args[0]].pop(0)
 
     probe = VmStatHeadroom(run=run)
-    # (1024 free + 64 speculative + min(512 inactive, 256 file-backed)) x 16 KiB
-    assert await probe() == (1024 + 64 + 256) * 16384 // _MIB == 21
+    assert await probe() == (1024 + 64 + 436) * 16384 // _MIB == 23
     # 640 pages of compressor growth (10 MB) is subtracted as pressure.
-    assert await probe() == 11
+    assert await probe() == 13
+
+
+@pytest.mark.asyncio
+async def test_vm_stat_headroom_counts_no_inactive_when_overlap_unproven():
+    # Reviewer counterexample: 1000 active file-backed + 1000 inactive anonymous.
+    text = _vm(free=0, active=1000, inactive=1000, speculative=0, file=1000)
+
+    async def run(args):
+        return text if args[0] == "vm_stat" else "0\n"
+
+    assert await VmStatHeadroom(run=run)() == 0
 
 
 @pytest.mark.asyncio

@@ -229,6 +229,16 @@ class Reaper:
         return self._delay
 
     @staticmethod
+    def reported_busy(entry: LoadedModel) -> bool:
+        """Runtime-reported activity: queued work, or any status but idle.
+
+        Unknown status counts as busy: an external tenant may be generating.
+        """
+        if entry.queued:
+            return True
+        return Reaper._entry_status(entry) != "idle"
+
+    @staticmethod
     def _entry_status(entry: LoadedModel) -> str | None:
         return entry.status.lower() if isinstance(entry.status, str) and entry.status else None
 
@@ -403,12 +413,19 @@ class Reaper:
         self._cache_loaded_entries(entries)
         resident = [entry.id for entry in entries if entry.id]
         baseline = await headroom_mb() if headroom_mb is not None else None
+        # Live path: never evict a model the runtime reports as active.
+        busy = {
+            entry.id for entry in entries
+            if headroom_mb is not None and self.reported_busy(entry)
+        }
 
         freed_mb = 0
         for victim in self.evictable_models(resident):
             if freed_mb >= needed_mb:
                 break
             if self.in_flight(victim) > 0 or self.in_flight(self.adapter.base_id(victim)) > 0:
+                continue
+            if victim in busy:
                 continue
             size_bytes = self._loaded_size_bytes.get(victim) or self._loaded_size_bytes.get(
                 self.adapter.base_id(victim)
