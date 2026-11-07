@@ -207,7 +207,7 @@ class LMStudioAdapter:
             kv_mb = 0
             estimate.append("context=unknown")
         else:
-            specs = self._kv_specs(base, entry)
+            specs = await self._kv_specs(base, entry)
             if specs is None:
                 per_sequence = _FALLBACK_KV_BYTES_PER_TOKEN * context_length
                 estimate.append("kv=no-architecture")
@@ -241,21 +241,49 @@ class LMStudioAdapter:
                 return entry
         return None
 
-    def _kv_specs(self, base: str, entry: dict | None) -> list[tuple[int, int | None]] | None:
+    async def _variant_dir(self, entry: dict) -> str | None:
+        """On-disk subpath of a hub model's selected variant.
+
+        ``lms ls --json`` reports hub models by hub id only; ``lms ls <path>
+        --json`` lists each variant's ``indexedModelIdentifier`` as
+        ``<hub id>@<publisher>/<directory under the models dir>``.
+        """
+        path, selected = entry.get("path"), entry.get("selectedVariant")
+        if not isinstance(path, str) or not entry.get("variants"):
+            return None
+        try:
+            rc, out, _err = await self._run(["ls", path, "--json"], timeout=30.0)
+            variants = json.loads(out or "[]") if rc == 0 else []
+        except Exception as exc:  # noqa: BLE001
+            log.warning("lmstudio: variant lookup failed for %s: %s", path, exc)
+            return None
+        variants = [v for v in variants if isinstance(v, dict)] if isinstance(variants, list) else []
+        chosen = [v for v in variants if v.get("modelKey") == selected] or (
+            variants if len(variants) == 1 else []
+        )
+        identity = chosen[0].get("indexedModelIdentifier") if chosen else None
+        if isinstance(identity, str) and "@" in identity:
+            return identity.split("@", 1)[1] or None
+        return None
+
+    async def _kv_specs(self, base: str, entry: dict | None) -> list[tuple[int, int | None]] | None:
         if base in self._kv_specs_cache:
             return self._kv_specs_cache[base]
         if not entry:
             return None
-        # Hub models can report a ``path`` that is not the on-disk directory;
-        # try each identity LM Studio reports and use the first with a config.
-        candidates = [
-            entry.get(key) for key in ("indexedModelIdentifier", "path")
-            if isinstance(entry.get(key), str) and entry.get(key)
-        ]
-        if not candidates:
-            return None
+        # Hub models report a ``path`` that is not the on-disk directory. Try the
+        # selected variant's real directory first, then each identity LM Studio
+        # reports, and use the first with a config.
+        candidates: list[tuple[str, str]] = []
+        variant_dir = await self._variant_dir(entry)
+        if variant_dir:
+            candidates.append(("variant", variant_dir))
+        for key in ("indexedModelIdentifier", "path"):
+            value = entry.get(key)
+            if isinstance(value, str) and value:
+                candidates.append((key, value))
         specs = None
-        for candidate in candidates:
+        for source, candidate in candidates:
             root = (
                 candidate if os.path.isabs(candidate)
                 else os.path.join(self._models_dir, candidate)
@@ -265,9 +293,11 @@ class LMStudioAdapter:
             try:
                 with open(os.path.join(root, "config.json"), encoding="utf-8") as handle:
                     specs = kv_layer_specs(json.load(handle))
+                log.info("lmstudio: architecture metadata for %s from %s: %s", base, source, root)
                 break
             except (OSError, ValueError) as exc:
-                log.info("lmstudio: no architecture metadata for %s at %s: %s", base, root, exc)
+                log.info("lmstudio: no architecture metadata for %s via %s at %s: %s",
+                         base, source, root, exc)
         self._kv_specs_cache[base] = specs
         return specs
 
