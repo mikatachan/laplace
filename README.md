@@ -174,7 +174,8 @@ tail_chars = 400
 {"inflight": [{"origin": "hermes", "model": "m", "stream": true,
   "started_at": 1762540000.1, "admitted_at": 1762540000.2,
   "first_byte_at": 1762540001.0, "last_chunk_at": 1762540042.5,
-  "bytes": 18234, "chunks": 311, "tail": "...last 400 characters"}],
+  "bytes": 18234, "chunks": 311, "tail": "...last 400 characters",
+  "observer_failed": false}],
  "now": 1762540043.0}
 ```
 
@@ -182,8 +183,10 @@ Times are Unix epoch seconds; `admitted_at` is null for remote backends.
 `tail` holds the last `tail_chars` characters of the streamed
 `delta.content` and `delta.reasoning_content` (or `delta.reasoning`) text,
 parsed from complete SSE `data:` lines; unparseable lines still count toward
-`bytes`. Each chunk is recorded only after it is written to the client, so the
-relayed stream is unchanged. A record is removed when its request ends, for any
+`bytes`; lines over 64 KiB are not parsed. Each chunk is recorded only after it
+is written to the client, so the relayed stream is unchanged. If recording a
+chunk ever raises, the stream continues untouched, `observer_failed` becomes
+true and that record stops updating. A record is removed when its request ends, for any
 reason. Records live in memory only, and tail text is never logged. The
 endpoint answers loopback peers only (403 otherwise) and, with
 `governed_rest_auth`, needs the same caller token as `/fleet/status`.
