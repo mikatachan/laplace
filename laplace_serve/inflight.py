@@ -14,9 +14,10 @@ import time
 
 from aiohttp import web
 
-# A partial SSE line longer than this is dropped (and the rest of that line
-# skipped) so a stream without newlines cannot grow the record's memory.
-MAX_PENDING_LINE_BYTES = 64 * 1024
+# An SSE line longer than this is never JSON-parsed, and a partial line longer
+# than this is dropped (with the rest of that line skipped), so one line cannot
+# grow the record's memory or parse cost.
+MAX_LINE_BYTES = 64 * 1024
 
 
 class InflightRecord:
@@ -33,6 +34,7 @@ class InflightRecord:
         self.bytes = 0
         self.chunks = 0
         self.tail = ""
+        self.observer_failed = False
         self._tail_chars = tail_chars
         self._pending = b""
         self._discarding = False
@@ -63,13 +65,15 @@ class InflightRecord:
         *lines, rest = (self._pending + chunk).split(b"\n")
         for line in lines:
             self._parse_line(line)
-        if len(rest) > MAX_PENDING_LINE_BYTES:
+        if len(rest) > MAX_LINE_BYTES:
             self._pending = b""
             self._discarding = True
         else:
             self._pending = rest
 
     def _parse_line(self, line: bytes) -> None:
+        if len(line) > MAX_LINE_BYTES:
+            return
         line = line.rstrip(b"\r")
         if not line.startswith(b"data:"):
             return
@@ -78,7 +82,8 @@ class InflightRecord:
             return
         try:
             payload = json.loads(data)
-        except (ValueError, UnicodeDecodeError):
+        except (ValueError, UnicodeDecodeError, RecursionError):
+            # RecursionError: deeply nested JSON from a malformed stream.
             return
         if not isinstance(payload, dict) or not isinstance(payload.get("choices"), list):
             return
@@ -111,6 +116,7 @@ class InflightRecord:
             "bytes": self.bytes,
             "chunks": self.chunks,
             "tail": self.tail,
+            "observer_failed": self.observer_failed,
         }
 
 

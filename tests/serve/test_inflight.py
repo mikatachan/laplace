@@ -11,7 +11,7 @@ from aiohttp.test_utils import make_mocked_request
 
 from laplace_serve import app as app_module
 from laplace_serve.config import InflightConfig, LaplacedConfig
-from laplace_serve.inflight import MAX_PENDING_LINE_BYTES, InflightRecord, InflightRegistry
+from laplace_serve.inflight import MAX_LINE_BYTES, InflightRecord, InflightRegistry
 from tests.serve.harness import UpstreamState, make_harness
 
 
@@ -245,14 +245,14 @@ async def test_tail_is_bounded_at_tail_chars():
 def test_record_ignores_parse_failures_and_bounds_partial_lines():
     record = InflightRecord("hermes", "m", True, tail_chars=400)
     record.observe(b"data: {broken\n\n")
-    record.observe(b"data: " + b"x" * (MAX_PENDING_LINE_BYTES + 1))
+    record.observe(b"data: " + b"x" * (MAX_LINE_BYTES + 1))
     assert record._pending == b""  # oversized partial line dropped
     record.observe(b"still the same line\n" + _sse(content="ok"))
     assert record.tail == "ok"
     assert record.chunks == 3
     assert record.bytes == (
         len(b"data: {broken\n\n")
-        + 6 + MAX_PENDING_LINE_BYTES + 1
+        + 6 + MAX_LINE_BYTES + 1
         + len(b"still the same line\n" + _sse(content="ok"))
     )
 
@@ -283,3 +283,69 @@ def test_tail_concatenates_content_and_reasoning_across_split_lines():
     assert record.tail == "think Hello, world!"
     assert record.bytes == len(b"".join(_CHAT_CHUNKS))
     assert record.chunks == len(_CHAT_CHUNKS)
+
+
+_NESTED = b"data: " + b"[" * 10_000 + b"]" * 10_000 + b"\n"  # 20,007 bytes + newline
+
+
+def test_deeply_nested_json_line_is_ignored_not_raised():
+    record = InflightRecord("hermes", "m", True, tail_chars=400)
+    record.observe(_NESTED)
+    record.observe(_sse(content="after"))
+    assert record.tail == "after"
+    assert record.observer_failed is False
+
+
+def test_oversized_complete_line_is_not_parsed():
+    record = InflightRecord("hermes", "m", True, tail_chars=400)
+    big = _sse(content="x" * (MAX_LINE_BYTES + 1))
+    record.observe(big + _sse(content="ok"))
+    assert record.tail == "ok"
+
+
+async def _stream_and_collect(h, chunks):
+    resp = await _post(h)
+    assert resp.status == 200
+    pieces = await _read_all(resp)  # returns only on EOF
+    assert resp.content.at_eof()
+    return b"".join(pieces)
+
+
+@pytest.mark.asyncio
+async def test_nested_brackets_line_stream_is_byte_identical_with_eof():
+    chunks = [_sse(content="a"), _NESTED + b"\n", _sse(content="b"), b"data: [DONE]\n\n"]
+    upstream = _gated_upstream(UpstreamState(), chunks, [], delay=0.02)
+    async with make_harness(upstream_app=upstream, config=_config(["hermes"])) as h:
+        received = await _stream_and_collect(h, chunks)
+        assert (await _wait_empty(h))["inflight"] == []
+    assert received == b"".join(chunks)
+
+
+@pytest.mark.asyncio
+async def test_observer_exception_is_contained_and_stream_is_byte_identical(
+    monkeypatch, caplog
+):
+    calls = []
+
+    def boom(self, chunk):
+        calls.append(chunk)
+        raise Exception("observer bug")
+
+    monkeypatch.setattr(InflightRecord, "observe", boom)
+    chunks = [_sse(content="secret-a"), _sse(content="b"), b"data: [DONE]\n\n"]
+    gates = [asyncio.Event()]
+    upstream = _gated_upstream(UpstreamState(), chunks, gates, delay=0.02)
+    async with make_harness(upstream_app=upstream, config=_config(["hermes"])) as h:
+        resp = await _post(h)
+        first = await resp.content.readexactly(len(chunks[0]))
+        record = (await _inflight(h))["inflight"][0]
+        assert record["observer_failed"] is True
+        gates[0].set()
+        rest = await _read_all(resp)
+        assert resp.content.at_eof()
+        assert (await _wait_empty(h))["inflight"] == []
+
+    assert first + b"".join(rest) == b"".join(chunks)
+    assert len(calls) == 1  # observation stopped after the first failure
+    assert "observer failed (Exception)" in caplog.text
+    assert "secret-a" not in caplog.text
