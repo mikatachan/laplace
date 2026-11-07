@@ -59,6 +59,9 @@ class LaplacedConfig:
     governed_rest_auth: bool = False
     upstream_auth_command: tuple[str, ...] = ()
     budget_mb: int = 0
+    # Opt-in: admit cold loads by KV-aware cost against live memory headroom
+    # (vm_stat) instead of the static [model_footprint_mb] sum.
+    live_memory_admission: bool = False
     max_concurrent: int = 2
     admit_timeout_s: float = 120.0
     fail_open: bool = True
@@ -154,6 +157,10 @@ class LaplacedConfig:
             raw["governed_rest_auth"], bool
         ):
             raise ValueError("laplaced config: governed_rest_auth must be a boolean")
+        if "live_memory_admission" in raw and not isinstance(
+            raw["live_memory_admission"], bool
+        ):
+            raise ValueError("laplaced config: live_memory_admission must be a boolean")
 
         origins = dict(raw.pop("origins", None) or dict(_DEFAULT_ORIGINS))
         caller_verifiers = _coerce_string_map(

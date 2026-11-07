@@ -27,7 +27,32 @@ class LoadedModel:
     context_length: int | None = None
 
 
+@dataclass(frozen=True)
+class LoadCost:
+    """Peak memory a model needs at the context and parallel it loads with.
+
+    ``estimate`` lists every input that was not derived from observed data
+    (catalog size, architecture metadata, configured parallel). Empty means
+    every term came from an observation.
+    """
+
+    weights_mb: int
+    kv_mb: int
+    overhead_mb: int
+    context_length: int | None
+    parallel: int
+    estimate: tuple[str, ...] = ()
+
+    @property
+    def total_mb(self) -> int:
+        return self.weights_mb + self.kv_mb + self.overhead_mb
+
+
 class InferenceAdapter(Protocol):
+    # Optional: ``async def load_cost(model_id, context_length) -> LoadCost | None``.
+    # The broker uses it for live-memory admission when the adapter provides it.
+
+
     async def list_loaded(self) -> list[LoadedModel]:
         """Return the currently resident model instances."""
 

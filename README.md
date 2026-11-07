@@ -191,6 +191,41 @@ reason. Records live in memory only, and tail text is never logged. The
 endpoint answers loopback peers only (403 otherwise) and, with
 `governed_rest_auth`, needs the same caller token as `/fleet/status`.
 
+### Opt-in live-memory admission
+
+By default a cold load is admitted when the static `[model_footprint_mb]`
+figures sum under the budget. That sum ignores context, parallel slots and
+what else is using memory. With the flag below, laplaced instead admits a
+cold load only when its cost fits in live headroom:
+
+```toml
+live_memory_admission = true
+```
+
+- **Cost** = weights + KV + overhead. Weights come from the `lms ls --json`
+  `sizeBytes` for the model, or from `[model_footprint_mb]` when the catalog
+  has no figure. KV = per-layer K+V bytes from the model's `config.json` (under
+  `~/.lmstudio/models/<path>`) x context length (sliding layers stop at their
+  window; linear-attention layers are skipped) x parallel (`[model_parallel]`).
+  Overhead is 10% of weights.
+- **Headroom** is read from `vm_stat` at each decision: free + speculative +
+  inactive pages up to the file-backed count, minus compressor growth since the
+  previous reading, capped by the room left under `iogpu.wired_limit_mb`.
+- **Reserved first**: the full KV a busy resident model can still grow to at
+  its loaded context (busy = in flight through laplaced, or `lms ps` reports it
+  as not idle or as having queued requests), plus the full cost of admitted
+  loads that are not resident yet.
+
+If the cost does not fit, idle models are evicted when their weights would
+cover the shortfall. Freed memory is measured with `vm_stat`, not inferred
+from file size. Otherwise the request waits for `admit_timeout_s` and then
+gets the usual 503. An unreadable `vm_stat` or an unknown cost also means
+wait, never load. Each decision logs one `load decision` line with every term;
+`basis=estimate(...)` names any term that was not derived from observed data
+(footprint-table weights, missing `config.json`, unpinned parallel, sized as 4).
+Requests for a model that is already resident do not need a new load and are
+admitted as before.
+
 ## Prior art / where Laplace fits
 
 See the assessment in `docs/`. Closest adjacent tools: **llama-swap** (own-process idle TTL), **ConductorAPI** (multi-runtime budgets+priority, early-stage), **ollamaMQ** (Ollama request-priority proxy), **LocalAI** (LRU + idle watchdog). None do external-tenant-aware reaping.
