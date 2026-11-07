@@ -388,7 +388,13 @@ class Reaper:
             return "stale"
         return "healthy"
 
-    async def request_free(self, needed_mb: int, priority=None) -> bool:
+    async def request_free(self, needed_mb: int, priority=None, *, headroom_mb=None) -> bool:
+        """Evict idle models, oldest first, until ``needed_mb`` is freed.
+
+        With ``headroom_mb`` (an async live-headroom probe), freed memory is the
+        measured headroom gain since eviction began; a victim's file size is
+        credited only when the probe cannot be read.
+        """
         if needed_mb <= 0:
             return True
         entries = await self.adapter.list_loaded()
@@ -396,6 +402,7 @@ class Reaper:
             return False
         self._cache_loaded_entries(entries)
         resident = [entry.id for entry in entries if entry.id]
+        baseline = await headroom_mb() if headroom_mb is not None else None
 
         freed_mb = 0
         for victim in self.evictable_models(resident):
@@ -409,7 +416,16 @@ class Reaper:
             unloaded = await self.adapter.force_unload(victim, reason="reaper:request-free")
             if not unloaded:
                 continue
-            if size_bytes:
+            now = await headroom_mb() if baseline is not None else None
+            if now is not None:
+                freed_mb = max(freed_mb, now - baseline)
+                log.info(
+                    "laplace.reaper: request-free unloaded %s; measured freed %s MB of %s",
+                    victim,
+                    freed_mb,
+                    needed_mb,
+                )
+            elif size_bytes:
                 freed_mb += int(size_bytes / (1024 * 1024))
             else:
                 freed_mb += needed_mb
