@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import math
@@ -22,6 +23,7 @@ from laplace_serve import origins
 from laplace_serve.admission import govern
 from laplace_serve.auth import CallerAuthenticator
 from laplace_serve.config import LaplacedConfig
+from laplace_serve.inflight import RECORD, InflightRegistry
 from laplace_serve.proxy import UpstreamProxy
 from laplace_serve.remote import RemoteFleet
 
@@ -42,6 +44,7 @@ PROXY = web.AppKey("proxy", UpstreamProxy)
 SESSION = web.AppKey("session", aiohttp.ClientSession)
 FLEET = web.AppKey("fleet", RemoteFleet)
 CALLER_AUTH = web.AppKey("caller_auth", Optional[CallerAuthenticator])
+INFLIGHT = web.AppKey("inflight", InflightRegistry)
 READYZ_PS_CHECK = web.AppKey("readyz_ps_check", object)
 UPSTREAM_LISTENER_CHECK = web.AppKey("upstream_listener_check", object)
 CATALOG_CHECK = web.AppKey("catalog_check", object)
@@ -67,6 +70,9 @@ def build_app(
     app[REAPER] = reaper
     app[BROKER] = broker
     app[FLEET] = RemoteFleet(config.backends, config.placement)
+    app[INFLIGHT] = InflightRegistry(
+        frozenset(config.inflight.origins), config.inflight.tail_chars
+    )
     app[CALLER_AUTH] = (
         CallerAuthenticator(config.caller_verifiers) if config.governed_rest_auth else None
     )
@@ -95,6 +101,7 @@ def build_app(
     app.router.add_get("/healthz", _healthz)
     app.router.add_get("/readyz", _readyz)
     app.router.add_get("/fleet/status", _fleet_status)
+    app.router.add_get("/inflight", _inflight)
     if config.governed_rest_auth:
         app.router.add_get("/ops/upstream-listener", _upstream_listener)
         app.router.add_get("/ops/upstream-api", _upstream_api)
@@ -202,6 +209,28 @@ async def _governed(request: web.Request) -> web.StreamResponse:
     forwarded_body = _canonicalize_forwarded_model(body, requested_model, model)
     ctx = config.model_context.get(model, config.default_context_length) if model else None
 
+    tracked = None
+    if _upstream_path(request) == "/v1/chat/completions":
+        tracked = request.app[INFLIGHT].start(origin, model, stream)
+    if tracked is None:
+        return await _route(request, origin, tier, model, stream, ctx, forwarded_body)
+    key, record = tracked
+    request[RECORD] = record
+    try:
+        return await _route(request, origin, tier, model, stream, ctx, forwarded_body)
+    finally:
+        request.app[INFLIGHT].finish(key)
+
+
+async def _route(
+    request: web.Request,
+    origin: str,
+    tier: str,
+    model: str | None,
+    stream: bool,
+    ctx: int | None,
+    forwarded_body: bytes,
+) -> web.StreamResponse:
     for backend_name in request.app[FLEET].route(origin, model):
         if backend_name == "axis":
             return await _forward_axis(
@@ -258,6 +287,9 @@ async def _forward_axis(
                     status=503,
                     headers={"Retry-After": "30"},
                 )
+            record = request.get(RECORD)
+            if record is not None:
+                record.mark_admitted()
             return await request.app[PROXY].forward(request, _upstream_path(request), forwarded_body)
     except ModelLoadError as exc:
         remaining = request.app[ADAPTER].guard_window_remaining_s()
@@ -303,6 +335,21 @@ async def _fleet_status(request: web.Request) -> web.Response:
     if denied is not None:
         return denied
     return web.json_response(request.app[FLEET].snapshot())
+
+
+async def _inflight(request: web.Request) -> web.Response:
+    # Tail text is model output: serve it to loopback callers only, whatever
+    # the listener's bind address, and behind the same auth as /fleet/status.
+    try:
+        loopback = ipaddress.ip_address(request.remote or "").is_loopback
+    except ValueError:
+        loopback = False
+    if not loopback:
+        return web.json_response({"error": "forbidden"}, status=403)
+    denied = _authenticate_status(request)
+    if denied is not None:
+        return denied
+    return web.json_response(request.app[INFLIGHT].snapshot())
 
 
 async def _readyz(request: web.Request) -> web.Response:
