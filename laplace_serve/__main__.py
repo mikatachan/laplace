@@ -11,6 +11,7 @@ from aiohttp import web
 
 from laplace.adapters.lmstudio import LMStudioAdapter
 from laplace.broker import ContentionBroker
+from laplace.memory import VmStatHeadroom
 from laplace.reaper import Reaper
 
 from laplace_serve.app import build_app
@@ -40,6 +41,7 @@ def build_components(
         budget_mb=config.budget_mb_or_none(),
         timeout_s=config.admit_timeout_s,
         max_concurrent_lms=config.max_concurrent,
+        headroom_mb=VmStatHeadroom() if config.live_memory_admission else None,
     )
     return adapter, reaper, broker
 

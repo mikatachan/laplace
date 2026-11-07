@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import heapq
 import logging
+from typing import Awaitable, Callable, Optional
 
-from laplace.adapter import InferenceAdapter
+from laplace.adapter import InferenceAdapter, LoadCost, LoadedModel
 from laplace.priority import PriorityTier, from_legacy_string
 from laplace.reaper import Reaper
 
@@ -28,7 +29,12 @@ class ContentionBroker:
         budget_mb: int | None = None,
         timeout_s: float = DEFAULT_TIMEOUT_S,
         max_concurrent_lms: int = DEFAULT_MAX_CONCURRENT_LMS,
+        headroom_mb: Optional[Callable[[], Awaitable[Optional[int]]]] = None,
     ):
+        """``headroom_mb`` enables live-memory admission: a cold load must fit
+        in the live headroom it returns, after reserving KV growth for busy
+        resident models and the full cost of admitted loads still pending.
+        Without it, admission uses the static footprint budget."""
         self._adapter = adapter
         self._reaper = reaper
         self._budget_override = budget_mb
@@ -40,6 +46,8 @@ class ContentionBroker:
         self._reserved: dict[str, int] = {}
         self._budget_cache: int | None = None
         self._footprint_cache: dict[str, int | None] = {}
+        self._headroom = headroom_mb
+        self._reserved_ctx: dict[str, int | None] = {}
         self._reaper.set_broker(self)
 
     async def admit(
@@ -70,6 +78,7 @@ class ContentionBroker:
                     model_id,
                     tier,
                     allow_evict=not evicted_this_cycle,
+                    context_length=context_length,
                 )
                 if decision == "admit":
                     self._wake()
@@ -81,7 +90,12 @@ class ContentionBroker:
                     evict_prio = None
             if needed_mb is not None:
                 try:
-                    await self._reaper.request_free(needed_mb, evict_prio)
+                    if self._headroom is not None:
+                        await self._reaper.request_free(
+                            needed_mb, evict_prio, headroom_mb=self._headroom
+                        )
+                    else:
+                        await self._reaper.request_free(needed_mb, evict_prio)
                 finally:
                     evicted_this_cycle = True
                 continue
@@ -141,6 +155,7 @@ class ContentionBroker:
                             self._reserved[model_id] = count
                         else:
                             self._reserved.pop(model_id, None)
+                            self._reserved_ctx.pop(model_id, None)
                         released = True
                     self._wake()
                 return
@@ -175,7 +190,10 @@ class ContentionBroker:
         priority: PriorityTier,
         *,
         allow_evict: bool = True,
+        context_length: int | None = None,
     ):
+        if self._headroom is not None and hasattr(self._adapter, "load_cost"):
+            return await self._try_admit_live(model_id, priority, allow_evict, context_length)
         footprint = await self._footprint_mb(model_id)
         if footprint is None:
             self._reserve(model_id)
@@ -209,8 +227,187 @@ class ContentionBroker:
         needed_mb = used + footprint - budget
         return ("evict", needed_mb, priority)
 
-    def _reserve(self, model_id: str) -> None:
+    async def _try_admit_live(
+        self,
+        model_id: str,
+        priority: PriorityTier,
+        allow_evict: bool,
+        context_length: int | None,
+    ):
+        if self._active_calls() >= self._max_concurrent:
+            return None
+        entries = [entry for entry in await self._adapter.list_loaded() if entry.id]
+        resident = [entry.id for entry in entries]
+        covered = self._covered_by_existing(model_id, context_length, entries)
+        if covered == "admit":
+            # No new load: an instance at this context is resident or pending.
+            self._reserve(model_id, context_length)
+            return "admit"
+        if covered == "wait":
+            log.info(
+                "laplace.broker: load decision model=%s ctx=%s decision=queue "
+                "reason=pending-load-at-smaller-context",
+                model_id,
+                context_length,
+            )
+            return None
+
+        cost = await self._adapter.load_cost(model_id, context_length)
+        if cost is None:
+            log.warning(
+                "laplace.broker: load decision model=%s ctx=%s decision=queue "
+                "reason=cost-unknown (no catalog size or footprint table entry)",
+                model_id,
+                context_length,
+            )
+            return None
+        headroom = await self._headroom()
+        if headroom is None:
+            log.warning(
+                "laplace.broker: load decision model=%s cost_mb=%s decision=queue "
+                "reason=headroom-unreadable",
+                model_id,
+                cost.total_mb,
+            )
+            return None
+
+        inflight_mb, inflight_estimate = await self._inflight_reserve_mb(entries, context_length)
+        pending_mb, pending_estimate = await self._pending_load_mb(resident)
+        available = headroom - inflight_mb - pending_mb
+        estimate = (*cost.estimate, *inflight_estimate, *pending_estimate)
+
+        def note(decision: str, **extra) -> None:
+            log.info(
+                "laplace.broker: load decision model=%s ctx=%s parallel=%s cost_mb=%s "
+                "(weights=%s kv=%s overhead=%s) headroom_mb=%s inflight_reserve_mb=%s "
+                "pending_mb=%s available_mb=%s basis=%s decision=%s%s",
+                model_id,
+                cost.context_length,
+                cost.parallel,
+                cost.total_mb,
+                cost.weights_mb,
+                cost.kv_mb,
+                cost.overhead_mb,
+                headroom,
+                inflight_mb,
+                pending_mb,
+                available,
+                f"estimate({','.join(estimate)})" if estimate else "derived",
+                decision,
+                "".join(f" {key}={value}" for key, value in extra.items()),
+            )
+
+        if cost.total_mb <= available:
+            note("admit")
+            self._reserve(model_id, context_length)
+            return "admit"
+
+        shortfall = cost.total_mb - available
+        evictable_ids = set(self._reaper.evictable_models(resident))
+        evictable = [
+            entry for entry in entries
+            if entry.id in evictable_ids and not self._is_busy(entry)
+        ]
+        # Credit idle victims with weights + overhead only: KV they no longer
+        # hold is not counted, so eviction is chosen only when it surely helps.
+        credit = 0
+        for entry in evictable:
+            victim = await self._adapter.load_cost(entry.id, entry.context_length)
+            if victim is not None:
+                credit += victim.weights_mb + victim.overhead_mb
+        if credit < shortfall or not allow_evict:
+            note("queue", shortfall_mb=shortfall, evictable_credit_mb=credit)
+            return None
+        note("evict", shortfall_mb=shortfall, evictable_credit_mb=credit)
+        return ("evict", shortfall, priority)
+
+    async def _inflight_reserve_mb(
+        self, entries: list[LoadedModel], requested_ctx: int | None
+    ) -> tuple[int, tuple[str, ...]]:
+        """KV a busy resident model may still grow to at its loaded context.
+
+        Live headroom already excludes KV a busy model holds now, so reserving
+        its full KV double-counts that part; the error is on the safe side.
+        """
+        total = 0
+        estimate: list[str] = []
+        for entry in entries:
+            if not self._is_busy(entry):
+                continue
+            ctx = entry.context_length
+            if ctx is None:
+                ctx = requested_ctx
+                estimate.append(f"inflight-ctx-unknown:{entry.id}")
+            cost = await self._adapter.load_cost(entry.id, ctx)
+            if cost is None:
+                estimate.append(f"inflight-cost-unknown:{entry.id}")
+                continue
+            total += cost.kv_mb
+            estimate.extend(f"inflight:{entry.id}:{item}" for item in cost.estimate)
+        return total, tuple(estimate)
+
+    async def _pending_load_mb(self, resident: list[str]) -> tuple[int, tuple[str, ...]]:
+        """Full cost of admitted loads that are not resident yet."""
+        total = 0
+        estimate: list[str] = []
+        for model_id in self._reserved:
+            if any(self._same_model(model_id, current) for current in resident):
+                continue
+            cost: LoadCost | None = await self._adapter.load_cost(
+                model_id, self._reserved_ctx.get(model_id)
+            )
+            if cost is None:
+                estimate.append(f"pending-cost-unknown:{model_id}")
+                continue
+            total += cost.total_mb
+            estimate.extend(f"pending:{model_id}:{item}" for item in cost.estimate)
+        return total, tuple(estimate)
+
+    def _is_busy(self, entry: LoadedModel) -> bool:
+        if self._reaper.in_flight(entry.id) > 0:
+            return True
+        if self._reaper.in_flight(self._adapter.base_id(entry.id)) > 0:
+            return True
+        if self._is_reserved(entry.id):
+            return True
+        return Reaper.reported_busy(entry)
+
+    def _covered_by_existing(
+        self, model_id: str, context_length: int | None, entries: list[LoadedModel]
+    ) -> str | None:
+        """Whether a resident or pending instance already pays for this request.
+
+        ``admit``: one resident instance, or a pending load, at a context at
+        least as large. ``wait``: a pending load at a smaller or unknown
+        context, which this request must not ride on. ``None``: decide on cost.
+        Parallel is fixed per model by [model_parallel], so context is the only
+        per-request dimension.
+        """
+        matches = [entry for entry in entries if self._same_model(model_id, entry.id)]
+        if matches:
+            if len(matches) == 1 and (
+                context_length is None
+                or (matches[0].context_length or 0) >= context_length
+            ):
+                return "admit"
+            return None
+        pending = [
+            reserved for reserved in self._reserved if self._same_model(model_id, reserved)
+        ]
+        if not pending:
+            return None
+        if context_length is None or any(
+            (self._reserved_ctx.get(reserved) or 0) >= context_length for reserved in pending
+        ):
+            return "admit"
+        return "wait"
+
+    def _reserve(self, model_id: str, context_length: int | None = None) -> None:
         self._reserved[model_id] = self._reserved.get(model_id, 0) + 1
+        if context_length is not None:
+            self._reserved_ctx[model_id] = max(
+                context_length, self._reserved_ctx.get(model_id) or 0
+            )
 
     def _active_calls(self) -> int:
         return sum(self._reserved.values())

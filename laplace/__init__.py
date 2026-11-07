@@ -1,6 +1,6 @@
 """Laplace public API."""
 
-from laplace.adapter import InferenceAdapter, LoadedModel
+from laplace.adapter import InferenceAdapter, LoadCost, LoadedModel
 from laplace.broker import ContentionBroker
 from laplace.priority import PriorityTier, resolve_priority
 from laplace.reaper import Reaper
@@ -8,6 +8,7 @@ from laplace.reaper import Reaper
 __all__ = [
     "ContentionBroker",
     "InferenceAdapter",
+    "LoadCost",
     "LoadedModel",
     "PriorityTier",
     "Reaper",
