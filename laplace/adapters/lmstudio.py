@@ -6,17 +6,31 @@ import asyncio
 import difflib
 import json
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass
 
-from laplace.adapter import LoadedModel, ModelLoadError
+from laplace.adapter import LoadCost, LoadedModel, ModelLoadError
 
 log = logging.getLogger(__name__)
 
 _MIB = 1024 * 1024
 _DEFAULT_LMS_CLI = "~/.lmstudio/bin/lms"
 _FOOTPRINT_OVERHEAD = 1.3
+_DEFAULT_MODELS_DIR = "~/.lmstudio/models"
+# fp16/bf16 KV entries. A quantized KV cache is smaller, so this over-reserves.
+_KV_DTYPE_BYTES = 2
+# Used only when no architecture metadata is readable. 256 KiB/token/sequence
+# exceeds the per-token KV of every model in the local MLX catalog (largest:
+# gemma-4-26B at 220 KiB inside its sliding window, GLM-4.5-Air at 184 KiB),
+# so it errs toward refusing a load.
+_FALLBACK_KV_BYTES_PER_TOKEN = 256 * 1024
+# Parallel used for sizing when [model_parallel] does not pin it: LM Studio
+# then applies its own default, which laplace cannot read.
+_FALLBACK_PARALLEL = 4
+# Runtime buffers beyond weights and KV, as a fraction of weights.
+_RUNTIME_OVERHEAD = 0.10
 
 
 @dataclass
@@ -40,6 +54,7 @@ class LMStudioAdapter:
         footprint_overrides: dict[str, int] | None = None,
         load_grace_s: float = 90.0,
         parallel_overrides: dict[str, int] | None = None,
+        models_dir: str | None = None,
     ):
         self._explicit_cli = lms_cli
         self._lms_cli = self._expand_home(lms_cli or _DEFAULT_LMS_CLI)
@@ -49,6 +64,9 @@ class LMStudioAdapter:
         self._footprint_overrides = self._normalize_overrides(footprint_overrides)
         self._parallel_overrides = self._normalize_overrides(parallel_overrides)
         self._footprint_cache: dict[str, int | None] = {}
+        self._models_dir = self._expand_home(models_dir or _DEFAULT_MODELS_DIR)
+        self._catalog_entries: dict[str, dict] = {}
+        self._kv_specs_cache: dict[str, list[tuple[int, int | None]] | None] = {}
         # Serialize mutations; resident admissions never wait for this lock.
         self._load_lock = asyncio.Lock()
         self._active_load: str | None = None
@@ -160,6 +178,98 @@ class LMStudioAdapter:
         estimate = self._parse_estimate_mb(f"{out}\n{err}")
         self._footprint_cache[model_id] = estimate
         return estimate
+
+    async def load_cost(self, model_id: str, context_length: int | None) -> LoadCost | None:
+        """Peak memory for ``model_id`` loaded at ``context_length`` x parallel.
+
+        weights: catalog ``sizeBytes``, else the configured footprint table.
+        kv: per-layer K+V bytes from the model's config.json, times context
+        (capped at the window for sliding layers) and parallel.
+        Returns None when no weight figure is known at all.
+        """
+        base = self.base_id(model_id)
+        estimate: list[str] = []
+        entry = await self._catalog_entry(model_id)
+        size = self._entry_size_bytes(entry) if entry else None
+        if size:
+            weights_mb = math.ceil(size / _MIB)
+        else:
+            override = self._footprint_overrides.get(base)
+            if override is None:
+                return None
+            weights_mb = override
+            estimate.append("weights=footprint-table")
+        parallel = self._parallel_overrides.get(base)
+        if parallel is None:
+            parallel = _FALLBACK_PARALLEL
+            estimate.append(f"parallel=unconfigured({parallel})")
+        if not context_length or context_length <= 0:
+            kv_mb = 0
+            estimate.append("context=unknown")
+        else:
+            specs = self._kv_specs(base, entry)
+            if specs is None:
+                per_sequence = _FALLBACK_KV_BYTES_PER_TOKEN * context_length
+                estimate.append("kv=no-architecture")
+            else:
+                per_sequence = kv_cache_bytes(specs, context_length)
+            kv_mb = math.ceil(per_sequence * parallel / _MIB)
+        return LoadCost(
+            weights_mb=weights_mb,
+            kv_mb=kv_mb,
+            overhead_mb=math.ceil(weights_mb * _RUNTIME_OVERHEAD),
+            context_length=context_length,
+            parallel=parallel,
+            estimate=tuple(estimate),
+        )
+
+    async def _catalog_entry(self, model_id: str) -> dict | None:
+        base = self.base_id(model_id)
+        if base in self._catalog_entries:
+            return self._catalog_entries[base]
+        try:
+            rc, out, err = await self._run(["ls", "--json"], timeout=30.0)
+            entries = json.loads(out or "[]") if rc == 0 else []
+        except Exception as exc:  # noqa: BLE001
+            log.warning("lmstudio: catalog lookup failed for %s: %s", model_id, exc)
+            return None
+        if not isinstance(entries, list):
+            return None
+        for entry in entries:
+            if isinstance(entry, dict) and self._matches(entry, base):
+                self._catalog_entries[base] = entry
+                return entry
+        return None
+
+    def _kv_specs(self, base: str, entry: dict | None) -> list[tuple[int, int | None]] | None:
+        if base in self._kv_specs_cache:
+            return self._kv_specs_cache[base]
+        if not entry:
+            return None
+        # Hub models can report a ``path`` that is not the on-disk directory;
+        # try each identity LM Studio reports and use the first with a config.
+        candidates = [
+            entry.get(key) for key in ("indexedModelIdentifier", "path")
+            if isinstance(entry.get(key), str) and entry.get(key)
+        ]
+        if not candidates:
+            return None
+        specs = None
+        for candidate in candidates:
+            root = (
+                candidate if os.path.isabs(candidate)
+                else os.path.join(self._models_dir, candidate)
+            )
+            if os.path.isfile(root):
+                root = os.path.dirname(root)
+            try:
+                with open(os.path.join(root, "config.json"), encoding="utf-8") as handle:
+                    specs = kv_layer_specs(json.load(handle))
+                break
+            except (OSError, ValueError) as exc:
+                log.info("lmstudio: no architecture metadata for %s at %s: %s", base, root, exc)
+        self._kv_specs_cache[base] = specs
+        return specs
 
     async def ensure_loaded(self, model_id: str, context_length: int | None) -> None:
         if not model_id or not context_length or context_length <= 0:
@@ -579,3 +689,56 @@ class LMStudioAdapter:
             except ValueError:
                 return None
         return None
+
+
+def kv_layer_specs(config: dict) -> list[tuple[int, int | None]] | None:
+    """Per attention layer: (K+V bytes per token, sliding window or None).
+
+    Reads Hugging Face / MLX config.json fields. Linear-attention layers keep a
+    fixed-size state, not a per-token cache, and are omitted. Returns None for
+    layouts this does not model (e.g. MLA) so callers fall back conservatively.
+    """
+    cfg = config.get("text_config") if isinstance(config.get("text_config"), dict) else config
+    try:
+        layers = int(cfg["num_hidden_layers"])
+        heads = int(cfg["num_attention_heads"])
+        kv_heads = int(cfg.get("num_key_value_heads") or heads)
+        head_dim = int(cfg.get("head_dim") or cfg["hidden_size"] // heads)
+        global_kv_heads = int(cfg.get("num_global_key_value_heads") or kv_heads)
+        global_head_dim = int(cfg.get("global_head_dim") or head_dim)
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        return None
+    if cfg.get("kv_lora_rank") or layers <= 0:
+        return None
+    window = cfg.get("sliding_window")
+    window = window if isinstance(window, int) and window > 0 else None
+    types = cfg.get("layer_types")
+    if not (isinstance(types, list) and len(types) == layers):
+        interval = cfg.get("full_attention_interval")
+        if isinstance(interval, int) and interval > 0:
+            types = [
+                "full_attention" if (i + 1) % interval == 0 else "linear_attention"
+                for i in range(layers)
+            ]
+        else:
+            # Without per-layer types, size every layer as full attention.
+            types = ["full_attention"] * layers
+    specs: list[tuple[int, int | None]] = []
+    for layer_type in types:
+        if layer_type == "full_attention":
+            specs.append((2 * global_kv_heads * global_head_dim * _KV_DTYPE_BYTES, None))
+        elif layer_type == "sliding_attention":
+            specs.append((2 * kv_heads * head_dim * _KV_DTYPE_BYTES, window))
+        elif layer_type == "linear_attention":
+            continue
+        else:
+            return None
+    return specs
+
+
+def kv_cache_bytes(specs: list[tuple[int, int | None]], context_length: int) -> int:
+    """KV bytes one sequence holds at ``context_length`` tokens."""
+    return sum(
+        per_token * (min(context_length, window) if window else context_length)
+        for per_token, window in specs
+    )
