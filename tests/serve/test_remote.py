@@ -656,3 +656,62 @@ async def test_auth_runs_at_start_and_on_401_not_per_request_and_key_is_not_logg
 
     assert sentinel not in caplog.text
     assert sentinel not in status_text
+
+
+@pytest.mark.asyncio
+async def test_successful_remote_forward_logs_served(caplog):
+    async def remote_chat(_request):
+        return web.json_response({"backend": "remote"})
+
+    remote_app = web.Application()
+    remote_app.router.add_post("/v1/chat/completions", remote_chat)
+    remote_server = await _start(remote_app)
+    caplog.set_level(logging.INFO, logger="laplace_serve.app")
+    try:
+        async with make_harness(
+            upstream_app=web.Application(),
+            config=_config(str(remote_server.make_url("")).rstrip("/")),
+        ) as harness:
+            harness.client.app[FLEET].backends["shinobi"].state = "UP"
+            response = await harness.client.post(
+                "/bot/v1/chat/completions", json={"model": "m"}
+            )
+            assert (await response.json())["backend"] == "remote"
+    finally:
+        await remote_server.close()
+
+    served = [
+        r.getMessage() for r in caplog.records if "reason=served" in r.getMessage()
+    ]
+    assert served == ["route origin=bot model=m backend=shinobi reason=served"]
+
+
+def test_state_transitions_log_once_per_change(caplog):
+    backend = RemoteBackend(
+        "shinobi",
+        RemoteBackendConfig(
+            url="http://127.0.0.1:1",
+            probe_model="probe-model",
+            auth_command=("secret-argv",),
+        ),
+        active=True,
+    )
+    caplog.set_level(logging.INFO, logger="laplace_serve.remote")
+
+    def transitions():
+        return [
+            r.getMessage() for r in caplog.records if "state" in r.getMessage()
+        ]
+
+    backend.record_probe_success()
+    assert transitions() == []
+    backend.record_probe_success()
+    assert transitions() == ["backend shinobi state DOWN->UP reason=None"]
+    backend.record_probe_success()
+    assert len(transitions()) == 1
+
+    backend.record_request_failure("connect")
+    assert transitions()[1:] == ["backend shinobi state UP->DOWN reason=connect"]
+    backend.record_request_failure("connect")
+    assert len(transitions()) == 2
+    assert "secret-argv" not in caplog.text
