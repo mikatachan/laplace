@@ -143,6 +143,22 @@ async def test_enabled_auth_removes_bare_routes_and_protects_models_and_status()
 
 
 @pytest.mark.asyncio
+async def test_enabled_auth_protects_api_v1_models():
+    async def models(_request):
+        return web.json_response({"models": []})
+
+    upstream = web.Application()
+    upstream.router.add_get("/api/v1/models", models)
+
+    async with make_harness(upstream_app=upstream, config=_config()) as h:
+        missing = await h.client.get("/hermes/api/v1/models")
+        ok = await h.client.get("/hermes/api/v1/models", headers=_bearer(CALLER_TOKEN))
+
+    assert missing.status == 401
+    assert ok.status == 200
+
+
+@pytest.mark.asyncio
 async def test_upstream_401_refreshes_helper_and_retries(monkeypatch):
     supplied = iter(("first-upstream-value", "second-upstream-value"))
 
