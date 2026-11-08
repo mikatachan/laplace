@@ -97,6 +97,8 @@ def build_app(
         app.router.add_get("/v1/{tail:.*}", _ungoverned)
 
     app.router.add_get("/{origin}/v1/models", _models)
+    # LM Studio native model list (Hermes reads capabilities from it). Exact path only.
+    app.router.add_get("/{origin}/api/v1/models", _models)
 
     app.router.add_get("/healthz", _healthz)
     app.router.add_get("/readyz", _readyz)
