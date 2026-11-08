@@ -521,6 +521,33 @@ async def test_ungoverned_models_passthrough_strips_prefix():
 
 
 @pytest.mark.asyncio
+async def test_api_v1_models_passthrough_exact_path_only():
+    state = UpstreamState()
+
+    async def models(request):
+        _record(state, request, await request.read())
+        return web.json_response({"models": []})
+
+    upstream = web.Application()
+    upstream.router.add_get("/api/v1/models", models)
+    upstream.router.add_post("/api/v1/models/load", models)
+
+    async with make_harness(upstream_app=upstream, upstream_state=state) as h:
+        resp = await h.client.get("/hermes/api/v1/models")
+        assert resp.status == 200
+        load_get = await h.client.get("/hermes/api/v1/models/load")
+        load_post = await h.client.post("/hermes/api/v1/models/load", json={})
+        chat = await h.client.post("/hermes/api/v1/chat", json={})
+        other = await h.client.get("/hermes/api/v1/other")
+
+    assert [r["path"] for r in state.requests] == ["/api/v1/models"]
+    assert load_get.status == 404
+    assert load_post.status == 404
+    assert chat.status == 404
+    assert other.status == 404
+
+
+@pytest.mark.asyncio
 async def test_upstream_connect_failure_returns_502():
     upstream = web.Application()  # unused; the proxy points at a dead port
     async with make_harness(
