@@ -294,3 +294,19 @@ the SAME model require coordination beyond this adapter.
 
 Startup logs ERRORs for configured context/footprint keys absent from the catalog,
 including the closest key, but continues serving.
+
+### Model ids in requests: send the full LM Studio id
+
+`[model_context]`, `[model_footprint_mb]`, `[model_parallel]` and `keep_loaded`
+are keyed by the LM Studio model key as `lms ls` reports it. Callers must send
+that full id in the request. laplaced matches an exact key first, then a bare id
+that equals the segment after the last `/` of exactly one configured key (for
+example `qwen3-coder-30b` for `qwen/qwen3-coder-30b`). It does not match
+prefixes or aliases. An id that matches nothing logs `unconfigured model id` and
+is used unchanged, with `default_context_length` (64000 by default) instead of
+its configured context.
+
+Example: with `"text-embedding-nomic-embed-text-v1.5" = 2048` in
+`[model_context]`, a request for `text-embedding-nomic-embed-text-v1.5` loads the
+embedder at 2048. A request for the shortened `nomic-embed-text` matches no key
+and loads it at 64000.

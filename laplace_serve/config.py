@@ -101,6 +101,11 @@ class LaplacedConfig:
         segment.  Do not guess when more than one configured key shares that
         segment: preserving the incoming id is safer than admitting a request
         against the wrong model.
+
+        Callers must send the full LM Studio model id.  There is no prefix or
+        alias matching: ``nomic-embed-text`` does not resolve to
+        ``text-embedding-nomic-embed-text-v1.5`` and gets
+        ``default_context_length`` instead of the configured context.
         """
         if not model_id:
             return model_id
