@@ -63,7 +63,7 @@ default = "scheduled"
 "google/gemma-4-e4b" = 32768
 "txgsync/gpt-oss-120b-derestricted" = 64000
 "glm-4.5-air-106b" = 64000
-"nomic-embed-text" = 2048
+"text-embedding-nomic-embed-text-v1.5" = 2048
 
 [model_parallel]
 "qwen3-next-80b-a3b-thinking" = 1

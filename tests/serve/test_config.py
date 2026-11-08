@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from laplace_serve.config import LaplacedConfig, missing_context_ids
@@ -40,7 +42,7 @@ def test_full_toml_parses():
         "log_rotate_mb": 10,
         "log_backups": 5,
         "origins": {"hermes": "interactive", "openclaw": "interactive", "default": "scheduled"},
-        "model_context": {"qwen3-next-80b-a3b-thinking": 131072, "nomic-embed-text": 2048},
+        "model_context": {"qwen3-next-80b-a3b-thinking": 131072, "text-embedding-nomic-embed-text-v1.5": 2048},
         "model_footprint_mb": {"qwen3-next-80b-a3b-thinking": 48000},
         "model_parallel": {"qwen3-next-80b-a3b-thinking": 1},
     }
@@ -50,6 +52,19 @@ def test_full_toml_parses():
     assert config.model_footprint_mb["qwen3-next-80b-a3b-thinking"] == 48000
     assert config.model_parallel["qwen3-next-80b-a3b-thinking"] == 1
     assert config.load_grace_s == 17
+
+
+def test_install_template_embedder_context_resolves(tmp_path):
+    script = (Path(__file__).resolve().parents[2] / "deploy" / "install-launchd.sh").read_text()
+    toml_text = script.split("<<'TOML'\n", 1)[1].split("\nTOML\n", 1)[0]
+    path = tmp_path / "laplaced.toml"
+    path.write_text(toml_text)
+
+    config = LaplacedConfig.from_toml_file(str(path))
+    model = "text-embedding-nomic-embed-text-v1.5"
+
+    assert config.canonical_model_id(model) == model
+    assert config.model_context[config.canonical_model_id(model)] == 2048
 
 
 def test_toml_loader_accepts_load_grace_s(tmp_path):
