@@ -249,6 +249,7 @@ See the assessment in `docs/`. Closest adjacent tools: **llama-swap** (own-proce
 - Leans on the runtime's activity-signal schema (`lms ps --json` fields), which is undocumented and could drift; fails safe (unknown means don't reap).
 - Shared-model gap: a model used by both you and an external process can't be perfectly distinguished by identity alone.
 - Not yet a published package; adapter extraction in progress (`EXTRACTION.md`).
+- Client disconnect closes the upstream request: for a stream, when the next chunk write fails; before upstream response headers (all of a non-stream generation), within `DISCONNECT_POLL_S` (1 s, `laplace_serve/proxy.py`). LM Studio stops generating when that connection closes, but its log says it finishes prompt processing first (observed for streams).
 
 ## License
 MIT.

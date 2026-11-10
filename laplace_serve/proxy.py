@@ -31,6 +31,10 @@ _HOP_BY_HOP = frozenset(
 _DROP_REQUEST = _HOP_BY_HOP | {"host", "content-length"}
 _DROP_CALLER_CREDENTIALS = {"authorization", "x-laplace-caller-authorization"}
 
+# How often a request waiting for upstream response headers checks whether its
+# downstream client is still connected. Module-level so tests can shrink it.
+DISCONNECT_POLL_S = 1.0
+
 
 class UpstreamProxy:
     """Relays requests to the LM Studio upstream, unbuffered and byte-faithful."""
@@ -96,12 +100,15 @@ class UpstreamProxy:
             headers["Authorization"] = f"Bearer {self._credential}"
 
         try:
-            upstream_resp = await self._session.request(
-                request.method,
-                url,
-                headers=headers,
-                params=request.query.copy() if request.query_string else None,
-                data=body or None,
+            upstream_resp = await _unless_disconnected(
+                request,
+                self._session.request(
+                    request.method,
+                    url,
+                    headers=headers,
+                    params=request.query.copy() if request.query_string else None,
+                    data=body or None,
+                ),
             )
         except (aiohttp.ClientConnectorError, aiohttp.ServerConnectionError, asyncio.TimeoutError) as exc:
             log.warning("proxy: upstream connect failed for %s: %s", upstream_path, exc)
@@ -113,12 +120,15 @@ class UpstreamProxy:
                 return web.json_response({"error": "upstream_auth_unavailable"}, status=502)
             headers["Authorization"] = f"Bearer {self._credential}"
             try:
-                upstream_resp = await self._session.request(
-                    request.method,
-                    url,
-                    headers=headers,
-                    params=request.query.copy() if request.query_string else None,
-                    data=body or None,
+                upstream_resp = await _unless_disconnected(
+                    request,
+                    self._session.request(
+                        request.method,
+                        url,
+                        headers=headers,
+                        params=request.query.copy() if request.query_string else None,
+                        data=body or None,
+                    ),
                 )
             except (
                 aiohttp.ClientConnectorError,
@@ -178,6 +188,49 @@ class UpstreamProxy:
             except (aiohttp.ClientError, asyncio.TimeoutError):
                 return False
         return False
+
+
+async def _unless_disconnected(request: web.Request, upstream_call):
+    """Await the upstream request, aborting it if the downstream client leaves.
+
+    aiohttp >= 3.9 does not cancel a handler when its client disconnects
+    (handler_cancellation defaults to False, and web.run_app keeps it). A
+    non-streaming upstream sends no bytes until generation ends, so no
+    downstream write can fail either: without this watch the upstream keeps
+    generating, and the admission slot stays held, until the model finishes.
+    The call runs inline (no extra task) so relay timing is unchanged; a
+    watcher cancels this handler task, which closes the upstream connection.
+    """
+    handler = asyncio.current_task()
+    fired = False
+
+    async def watch() -> None:
+        nonlocal fired
+        while True:
+            await asyncio.sleep(DISCONNECT_POLL_S)
+            transport = request.transport
+            if transport is None or transport.is_closing():
+                fired = True
+                handler.cancel()
+                return
+
+    watcher = asyncio.ensure_future(watch())
+    try:
+        return await upstream_call
+    except asyncio.CancelledError:
+        if not fired:
+            raise
+        if hasattr(handler, "uncancel"):  # Python >= 3.11
+            handler.uncancel()
+        log.info(
+            "proxy: client disconnected before upstream responded; aborted upstream %s",
+            request.path,
+        )
+        # aiohttp treats a ConnectionError from a handler as a premature
+        # client disconnection and drops the connection quietly.
+        raise ConnectionResetError("downstream client disconnected") from None
+    finally:
+        watcher.cancel()
 
 
 async def _relay(
