@@ -328,6 +328,64 @@ async def test_downstream_disconnect_aborts_upstream_and_releases():
 
 
 @pytest.mark.asyncio
+async def test_downstream_disconnect_before_upstream_headers_aborts_upstream(monkeypatch):
+    # Non-stream: LM Studio sends nothing until generation ends, so no write
+    # ever fails. The disconnect must still abort the upstream request.
+    from laplace_serve import proxy
+
+    monkeypatch.setattr(proxy, "DISCONNECT_POLL_S", 0.02, raising=False)
+    state = UpstreamState()
+
+    async def generate_slowly(request):
+        _record(state, request, await request.read())
+        try:
+            await asyncio.sleep(10)  # "generation": no byte is sent until it ends
+        except asyncio.CancelledError:  # the fake upstream's connection closed
+            state.aborted = True
+            raise
+        return web.json_response({"choices": []})
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/chat/completions", generate_slowly)
+
+    adapter = FakeAdapter(
+        loaded=[loaded_model("m", size_bytes=10 * _GIB)],
+        footprints={"m": 1000},
+    )
+    reaper = Reaper(adapter)
+    broker = ContentionBroker(adapter, reaper, budget_mb=90000)
+
+    async with make_harness(
+        upstream_app=upstream, upstream_state=state,
+        adapter=adapter, reaper=reaper, broker=broker,
+    ) as h:
+        call = asyncio.ensure_future(
+            h.client.post(
+                "/hermes/v1/chat/completions",
+                data=_json_body(model="m", stream=False),
+                headers={"Content-Type": "application/json"},
+            )
+        )
+        for _ in range(200):
+            if state.requests:
+                break
+            await asyncio.sleep(0.01)
+        assert state.requests  # admitted and forwarded
+        assert broker._active_calls() == 1
+        call.cancel()  # client gives up (timeout) and closes its connection
+        with pytest.raises(asyncio.CancelledError):
+            await call
+
+        for _ in range(100):  # 2 s, far below the 10 s generation
+            if state.aborted and broker._active_calls() == 0:
+                break
+            await asyncio.sleep(0.02)
+
+    assert state.aborted is True  # upstream saw its connection close
+    assert broker._active_calls() == 0  # slot released
+
+
+@pytest.mark.asyncio
 async def test_edge_a_upstream_non_200_relayed_as_is():
     state = UpstreamState()
 
