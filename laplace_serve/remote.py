@@ -19,6 +19,8 @@ log = logging.getLogger(__name__)
 
 PROBE_INTERVAL_S = 120.0
 PROBE_TIMEOUT_S = 10.0
+# A non-UP backend may need a cold JIT model load (~41 s measured on shinobi).
+PROBE_COLD_TIMEOUT_S = 60.0
 QUEUE_TIMEOUT_S = 10.0
 FIRST_BYTE_TIMEOUT_S = 120.0
 FALLBACK_HTTP_STATUSES = frozenset({400, 404, 429})
@@ -142,6 +144,7 @@ class RemoteBackend:
             },
             separators=(",", ":"),
         ).encode()
+        timeout_s = PROBE_TIMEOUT_S if self.state == "UP" else PROBE_COLD_TIMEOUT_S
         success_url = None
         failure_reason = "probe-failed"
         for base_url in self._ordered_urls():
@@ -153,7 +156,7 @@ class RemoteBackend:
                         "Authorization": f"Bearer {self._credential}",
                         "Content-Type": "application/json",
                     },
-                    timeout=aiohttp.ClientTimeout(total=PROBE_TIMEOUT_S),
+                    timeout=aiohttp.ClientTimeout(total=timeout_s),
                 ) as response:
                     if response.status == 401:
                         await self._refresh_credential()
