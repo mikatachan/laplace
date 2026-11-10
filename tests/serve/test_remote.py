@@ -13,7 +13,12 @@ from aiohttp.test_utils import TestServer
 import laplace_serve.remote as remote_module
 from laplace_serve.app import FLEET
 from laplace_serve.config import LaplacedConfig, RemoteBackendConfig
-from laplace_serve.remote import PROBE_INTERVAL_S, PROBE_TIMEOUT_S, RemoteBackend
+from laplace_serve.remote import (
+    PROBE_COLD_TIMEOUT_S,
+    PROBE_INTERVAL_S,
+    PROBE_TIMEOUT_S,
+    RemoteBackend,
+)
 from tests.serve.harness import UpstreamState, make_harness
 
 
@@ -224,6 +229,8 @@ async def test_probe_posts_required_shape_and_needs_two_successes():
 
     assert PROBE_INTERVAL_S == 120
     assert PROBE_TIMEOUT_S == 10
+    assert PROBE_COLD_TIMEOUT_S == 60
+    assert PROBE_COLD_TIMEOUT_S < PROBE_INTERVAL_S
     assert payloads == [
         {
             "model": "probe-model",
@@ -238,6 +245,47 @@ async def test_probe_posts_required_shape_and_needs_two_successes():
             "temperature": 0,
         },
     ]
+
+
+@pytest.mark.asyncio
+async def test_probe_timeout_is_cold_when_not_up_and_short_when_up(monkeypatch):
+    totals = []
+    real_timeout = aiohttp.ClientTimeout
+
+    def recording_timeout(*args, **kwargs):
+        totals.append(kwargs.get("total"))
+        return real_timeout(*args, **kwargs)
+
+    monkeypatch.setattr(remote_module.aiohttp, "ClientTimeout", recording_timeout)
+
+    async def chat(request):
+        return _probe_response()
+
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", chat)
+    server = await _start(app)
+    backend = RemoteBackend(
+        "shinobi",
+        RemoteBackendConfig(
+            url=str(server.make_url("")).rstrip("/"),
+            probe_model="probe-model",
+            auth_command=("stub",),
+        ),
+        active=True,
+    )
+    backend._credential = "test-key"
+    backend._session = aiohttp.ClientSession()
+    try:
+        assert backend.state == "DOWN"
+        await backend.probe_once()  # DOWN -> cold timeout
+        await backend.probe_once()  # second success flips to UP
+        assert backend.state == "UP"
+        await backend.probe_once()  # UP -> short timeout
+    finally:
+        await backend.close()
+        await server.close()
+
+    assert totals == [PROBE_COLD_TIMEOUT_S, PROBE_COLD_TIMEOUT_S, PROBE_TIMEOUT_S]
 
 
 @pytest.mark.asyncio
