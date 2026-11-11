@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from laplace.adapter import LoadedModel
 
 
@@ -90,3 +92,30 @@ def loaded_model(
         queued=queued,
         context_length=context_length,
     )
+
+
+class GatedUnloadAdapter(FakeAdapter):
+    """FakeAdapter whose force_unload blocks until ``gate`` is set.
+
+    ``events`` records the order of unload start/end and ensure_loaded calls,
+    so a test can hold a reaper unload open and observe what an admission does
+    in that window.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.gate = asyncio.Event()
+        self.unload_started = asyncio.Event()
+        self.events: list[str] = []
+
+    async def force_unload(self, model_id: str, *, reason: str = "direct") -> bool:
+        self.events.append(f"unload-start:{model_id}")
+        self.unload_started.set()
+        await self.gate.wait()
+        result = await super().force_unload(model_id, reason=reason)
+        self.events.append(f"unload-end:{model_id}")
+        return result
+
+    async def ensure_loaded(self, model_id: str, context_length: int | None) -> None:
+        self.events.append(f"ensure_loaded:{model_id}")
+        await super().ensure_loaded(model_id, context_length)

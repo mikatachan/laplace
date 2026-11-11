@@ -34,6 +34,8 @@ class Reaper:
         self._pending: dict[str, asyncio.Task] = {}
         self._in_flight: dict[str, int] = {}
         self._loading: dict[str, int] = {}
+        self._unloading: dict[str, int] = {}
+        self._unload_done: dict[str, asyncio.Event] = {}
         self._base_index: dict[str, set[str]] = {}
         self._managed: set[str] = set()
         self._loaded_size_bytes: dict[str, int] = {}
@@ -128,7 +130,55 @@ class Reaper:
             self._pending[model_id] = asyncio.create_task(self._delayed_unload(model_id))
             return
         self._pending.pop(model_id, None)
-        await self.adapter.force_unload(model_id, reason="reaper:idle-delay")
+        await self._unload(model_id, reason="reaper:idle-delay")
+
+    def is_unloading(self, model_id: str) -> bool:
+        """Whether a reaper unload of this model's base is in progress."""
+        if not model_id:
+            return False
+        return self._unloading.get(self.adapter.base_id(model_id), 0) > 0
+
+    async def wait_unloaded(self, model_id: str) -> None:
+        """Return once no reaper unload of this model's base is in progress."""
+        if not model_id:
+            return
+        base_id = self.adapter.base_id(model_id)
+        while self._unloading.get(base_id, 0) > 0:
+            await self._unload_done[base_id].wait()
+
+    async def _unload(self, model_id: str, *, reason: str) -> bool:
+        """Unload ``model_id`` unless an admission has claimed it since selection.
+
+        Callers pick victims from a list built before earlier awaits, so the
+        claim check runs again here. The check and the unloading mark have no
+        await between them, and govern() pins with start_loading() before it
+        checks is_unloading(). So either this skips the model, or the admission
+        waits until the unload, including its retry, has returned.
+        """
+        base_id = self.adapter.base_id(model_id)
+        if self._is_loading(model_id) or self._in_flight.get(model_id, 0) > 0:
+            log.info(
+                "laplace.reaper: skip unload of %s (%s): claimed by an admission",
+                model_id,
+                reason,
+            )
+            return False
+        self._unloading[base_id] = self._unloading.get(base_id, 0) + 1
+        done = self._unload_done.setdefault(base_id, asyncio.Event())
+        try:
+            return await self.adapter.force_unload(model_id, reason=reason)
+        finally:
+            remaining = self._unloading.get(base_id, 0) - 1
+            if remaining > 0:
+                self._unloading[base_id] = remaining
+            else:
+                self._unloading.pop(base_id, None)
+                self._unload_done.pop(base_id, None)
+                done.set()
+                wake = getattr(self._broker, "wake_waiter", None)
+                if wake is not None:
+                    # Wake an admission the broker queued behind this unload.
+                    wake()
 
     @property
     def pending_unloads(self) -> list[str]:
@@ -339,7 +389,7 @@ class Reaper:
             size_bytes = self._loaded_size_bytes.get(model_id) or self._loaded_size_bytes.get(
                 self.adapter.base_id(model_id)
             )
-            unloaded = await self.adapter.force_unload(model_id, reason="reaper:managed-idle-sweep")
+            unloaded = await self._unload(model_id, reason="reaper:managed-idle-sweep")
             if not unloaded:
                 continue
             unloaded_count += 1
@@ -375,7 +425,7 @@ class Reaper:
             size_bytes = self._loaded_size_bytes.get(model_id) or self._loaded_size_bytes.get(
                 self.adapter.base_id(model_id)
             )
-            unloaded = await self.adapter.force_unload(model_id, reason="reaper:external-idle-sweep")
+            unloaded = await self._unload(model_id, reason="reaper:external-idle-sweep")
             self._ext_idle_sweeps.pop(model_id, None)
             self._ext_last_used_seen.pop(model_id, None)
             if not unloaded:
@@ -430,7 +480,7 @@ class Reaper:
             size_bytes = self._loaded_size_bytes.get(victim) or self._loaded_size_bytes.get(
                 self.adapter.base_id(victim)
             )
-            unloaded = await self.adapter.force_unload(victim, reason="reaper:request-free")
+            unloaded = await self._unload(victim, reason="reaper:request-free")
             if not unloaded:
                 continue
             now = await headroom_mb() if baseline is not None else None

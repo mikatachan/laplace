@@ -283,3 +283,32 @@ async def test_cancelled_parked_waiter_removed_from_heap():
         await task
 
     assert broker._waiters == []
+
+
+@pytest.mark.asyncio
+async def test_admit_queues_while_reaper_unloads_model(caplog):
+    # The model is still listed while the reaper unloads it; admitting then
+    # would ride on a leaving instance. Queue, then admit once the unload ends.
+    from tests.fakes import GatedUnloadAdapter
+
+    model = "qwen3.8-27b-uncensored-mlx"
+    adapter = GatedUnloadAdapter(
+        loaded=[loaded_model(model, size_bytes=20 * _GIB)],
+        footprints={model: 26000},
+    )
+    broker, reaper = _broker(adapter, timeout_s=5.0)
+    reaper.mark_managed(model)
+    reaper._last_used[model] = 0.0
+
+    caplog.set_level("INFO", logger="laplace.broker")
+    unload = asyncio.create_task(reaper.request_free(10000))
+    await asyncio.wait_for(adapter.unload_started.wait(), 1.0)
+    admit = asyncio.create_task(broker.admit(model, None, "interactive"))
+    await asyncio.sleep(0.05)
+    assert not admit.done()
+    assert "reason=unload-in-progress" in caplog.text
+
+    adapter.gate.set()
+    assert await asyncio.wait_for(admit, 2.0) == "admit"
+    await unload
+    assert model not in adapter.loaded

@@ -80,6 +80,7 @@ class ContentionBroker:
                     allow_evict=not evicted_this_cycle,
                     context_length=context_length,
                 )
+                queued_for_unload = decision is None and self._reaper.is_unloading(model_id)
                 if decision == "admit":
                     self._wake()
                     return "admit"
@@ -104,6 +105,10 @@ class ContentionBroker:
                 remaining = deadline - loop.time()
                 if remaining <= 0:
                     return "backpressure"
+                if queued_for_unload and not self._reaper.is_unloading(model_id):
+                    # The unload ended before we parked, so its wake found no
+                    # waiter. Re-evaluate now instead of waiting for another.
+                    continue
                 fut = loop.create_future()
                 self._counter += 1
                 entry = (int(tier), self._counter, fut)
@@ -170,6 +175,13 @@ class ContentionBroker:
         async with self._lock:
             self._wake()
 
+    def wake_waiter(self) -> None:
+        """Wake the head waiter from synchronous code (the reaper's unload exit).
+
+        The heap is only mutated in synchronous stretches, so this needs no lock.
+        """
+        self._wake()
+
     def _wake(self) -> None:
         while self._waiters:
             _, _, fut = heapq.heappop(self._waiters)
@@ -195,6 +207,8 @@ class ContentionBroker:
         if self._headroom is not None and hasattr(self._adapter, "load_cost"):
             return await self._try_admit_live(model_id, priority, allow_evict, context_length)
         footprint = await self._footprint_mb(model_id)
+        if self._unload_in_progress(model_id, context_length):
+            return None
         if footprint is None:
             self._reserve(model_id)
             return "admit"
@@ -203,6 +217,8 @@ class ContentionBroker:
 
         budget = await self._budget_mb()
         resident = await self._resident()
+        if self._unload_in_progress(model_id, context_length):
+            return None
 
         if self._is_committed(model_id, resident):
             self._reserve(model_id)
@@ -238,6 +254,8 @@ class ContentionBroker:
             return None
         entries = [entry for entry in await self._adapter.list_loaded() if entry.id]
         resident = [entry.id for entry in entries]
+        if self._unload_in_progress(model_id, context_length):
+            return None
         covered = self._covered_by_existing(model_id, context_length, entries)
         if covered == "admit":
             # No new load: an instance at this context is resident or pending.
@@ -320,6 +338,23 @@ class ContentionBroker:
             return None
         note("evict", shortfall_mb=shortfall, evictable_credit_mb=credit)
         return ("evict", shortfall, priority)
+
+    def _unload_in_progress(self, model_id: str, context_length: int | None) -> bool:
+        """Queue a request whose model the reaper is unloading right now.
+
+        The model can still be listed as resident, so admitting would ride on
+        an instance that is leaving. Checked after the last residency await so
+        an unload that began during that await is seen.
+        """
+        if not self._reaper.is_unloading(model_id):
+            return False
+        log.info(
+            "laplace.broker: load decision model=%s ctx=%s decision=queue "
+            "reason=unload-in-progress",
+            model_id,
+            context_length,
+        )
+        return True
 
     async def _inflight_reserve_mb(
         self, entries: list[LoadedModel], requested_ctx: int | None
