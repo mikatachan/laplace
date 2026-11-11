@@ -378,3 +378,30 @@ async def test_run_sweep_loop_survives_exception_and_stops(monkeypatch: pytest.M
     reaper.stop_sweep_loop()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+@pytest.mark.asyncio
+async def test_request_free_skips_victim_claimed_during_earlier_unload():
+    # request_free picks its victims up front, then awaits each unload. A model
+    # an admission pinned during an earlier unload must not be unloaded.
+    from tests.fakes import GatedUnloadAdapter
+
+    adapter = GatedUnloadAdapter(
+        loaded=[
+            loaded_model("old/model", size_bytes=10 * _GIB),
+            loaded_model("new/model", size_bytes=10 * _GIB),
+        ]
+    )
+    reaper = Reaper(adapter, delay_seconds=0.0)
+    for model, age in (("old/model", 7200.0), ("new/model", 3600.0)):
+        reaper.mark_managed(model)
+        reaper._last_used[model] = time.monotonic() - age
+
+    task = asyncio.create_task(reaper.request_free(1_000_000))
+    await asyncio.wait_for(adapter.unload_started.wait(), 1.0)
+    reaper.start_loading("new/model")
+    adapter.gate.set()
+    await asyncio.wait_for(task, 2.0)
+
+    assert adapter.force_unload_calls == ["old/model"]
+    assert "new/model" in adapter.loaded

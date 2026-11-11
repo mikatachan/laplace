@@ -85,6 +85,10 @@ async def govern(
             reaper.mark_managed(model)
         reaper.start_loading(model)
         try:
+            # The pin above stops new reaper unloads of this model. One that
+            # began earlier must finish first, or we would proxy to (or load
+            # into) a model the reaper is still removing.
+            await reaper.wait_unloaded(model)
             await adapter.ensure_loaded(model, ctx)
         finally:
             reaper.finish_loading(model)
