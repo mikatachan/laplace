@@ -265,6 +265,12 @@ rechecked on each request, not cached. Automatic context upgrades are not done:
 this adapter cannot prove an instance is idle for external clients, and has no
 atomic reservation-and-unload interface. An operator must reconcile that instance.
 
+While the reaper unloads a model, `lms ps` can still list it. The broker queues
+new requests for that model (`reason=unload-in-progress`) instead of riding on the
+leaving instance, and an admitted request waits for the unload, including its
+retry, to return before it loads or proxies. Each reaper unload re-checks that no
+admission has pinned the victim since it was selected.
+
 A timed-out CLI is killed and reaped. Timeouts, cancellation, nonzero exits, and
 successful commands without a visible result retain the load's monotonic start
 time. Until `load_timeout_s + load_grace_s` has elapsed from that start, unresolved
