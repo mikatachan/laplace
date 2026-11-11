@@ -252,3 +252,85 @@ async def test_iii_concurrent_a_fails_b_succeeds_stays_managed():
     await asyncio.wait_for(task_b, timeout=2.0)
     assert reaper.is_managed(_MODEL) is True
     assert broker._active_calls() == 0
+
+
+_RACE_MODEL = "qwen3.8-27b-uncensored-mlx"
+
+
+def _unloading_pool():
+    """A resident, managed, idle model whose reaper unload the test holds open."""
+    from tests.fakes import GatedUnloadAdapter
+
+    adapter = GatedUnloadAdapter(
+        loaded=[loaded_model(_RACE_MODEL, size_bytes=20 * _GIB, context_length=131072)],
+        footprints={_RACE_MODEL: 26000},
+    )
+    reaper = Reaper(adapter)
+    reaper.mark_managed(_RACE_MODEL)
+    reaper._last_used[_RACE_MODEL] = time.monotonic() - 3600.0
+    return adapter, reaper
+
+
+async def _govern_and_record(broker, reaper, adapter):
+    async with govern(
+        broker, reaper, adapter,
+        model=_RACE_MODEL, ctx=131072, tier="interactive", fail_open=False,
+    ) as adm:
+        adapter.events.append(f"proxy:{adm.decision}")
+        return _RACE_MODEL in adapter.loaded
+
+
+@pytest.mark.asyncio
+async def test_admission_waits_for_inflight_reaper_unload_of_same_model():
+    # 2026-11-10 15:06:52: request_free began unloading the model, a request for
+    # that model was admitted while lms ps still listed it, and was proxied to
+    # an instance that was going away (HTTP 400).
+    adapter, reaper = _unloading_pool()
+    broker = ContentionBroker(adapter, reaper, budget_mb=87040, timeout_s=5.0)
+
+    unload = asyncio.create_task(reaper.request_free(10000))
+    await asyncio.wait_for(adapter.unload_started.wait(), 1.0)
+
+    request = asyncio.create_task(_govern_and_record(broker, reaper, adapter))
+    await asyncio.sleep(0.05)
+    proxied_mid_unload = [e for e in adapter.events if e.startswith(("proxy", "ensure_loaded"))]
+    adapter.gate.set()
+
+    resident_at_proxy = await asyncio.wait_for(request, 2.0)
+    assert await asyncio.wait_for(unload, 2.0) is True
+    assert proxied_mid_unload == []
+    assert adapter.events == [
+        f"unload-start:{_RACE_MODEL}",
+        f"unload-end:{_RACE_MODEL}",
+        f"ensure_loaded:{_RACE_MODEL}",
+        "proxy:admit",
+    ]
+    assert resident_at_proxy is True
+
+
+class _AdmitBroker:
+    async def admit(self, *_args, **_kwargs):
+        return "admit"
+
+    async def done(self, *_args, **_kwargs):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_govern_waits_for_unload_that_began_after_broker_admit():
+    # Backstop: the broker decided before the unload started, so only govern's
+    # wait stands between the request and the leaving instance.
+    adapter, reaper = _unloading_pool()
+
+    unload = asyncio.create_task(reaper.request_free(10000))
+    await asyncio.wait_for(adapter.unload_started.wait(), 1.0)
+    request = asyncio.create_task(_govern_and_record(_AdmitBroker(), reaper, adapter))
+    await asyncio.sleep(0.05)
+    assert "proxy:admit" not in adapter.events
+    adapter.gate.set()
+
+    assert await asyncio.wait_for(request, 2.0) is True
+    await asyncio.wait_for(unload, 2.0)
+    assert adapter.events.index(f"unload-end:{_RACE_MODEL}") < adapter.events.index(
+        f"ensure_loaded:{_RACE_MODEL}"
+    )
