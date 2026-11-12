@@ -106,13 +106,20 @@ def test_evictable_models_excludes_external_and_orders_oldest_first():
 
 
 @pytest.mark.asyncio
-async def test_reap_duplicates_keeps_in_flight_and_unloads_extra():
+async def test_reap_duplicates_waits_for_base_requests_then_unloads_extra():
+    # Was test_reap_duplicates_keeps_in_flight_and_unloads_extra, which reaped
+    # the extra while a request was in flight. Which sibling serves a request
+    # is a guess, so duplicates are reaped only once the base is idle.
     loaded = [
         loaded_model("txgsync/gpt-oss-120b"),
         loaded_model("txgsync/gpt-oss-120b:2"),
     ]
     reaper, adapter = _reaper(loaded=loaded)
     reaper.acquire("txgsync/gpt-oss-120b")
+    assert await reaper.reap_duplicates() == []
+    assert adapter.force_unload_calls == []
+
+    reaper.release("txgsync/gpt-oss-120b")
     reaped = await reaper.reap_duplicates()
     assert reaped == ["txgsync/gpt-oss-120b:2"]
     assert adapter.force_unload_calls == ["txgsync/gpt-oss-120b:2"]
@@ -520,3 +527,49 @@ async def test_unload_guard_rechecks_base_when_request_booked_on_stale_sibling()
 
     assert adapter.force_unload_calls == ["a/old"]
     assert "org/x:3" in adapter.loaded
+
+
+@pytest.mark.asyncio
+async def test_reap_duplicates_keeps_generating_sibling_when_request_booked_elsewhere():
+    # Codex review of #24 (610ed03): acquire(X) is booked on a guessed X:2 while
+    # X:3, which the runtime reports generating, serves it. Duplicate reaping
+    # kept X:2 and unloaded X:3 mid-request.
+    reaper, adapter = _reaper(
+        loaded=[
+            loaded_model("org/x:2", status="idle"),
+            loaded_model("org/x:3", status="generating"),
+        ]
+    )
+    reaper.evictable_models(["org/x:2", "org/x:3"])
+    reaper._last_used["org/x:2"] = time.monotonic()
+    reaper._last_used["org/x:3"] = time.monotonic() - 3600.0
+    reaper.acquire("org/x")
+    assert reaper.in_flight("org/x:2") == 1  # the guess
+    assert await reaper.reap_duplicates() == []
+    assert adapter.force_unload_calls == []
+
+
+@pytest.mark.asyncio
+async def test_reap_duplicates_keeps_sibling_runtime_reports_generating():
+    # No laplaced request at all: another tenant is generating on X:3.
+    reaper, adapter = _reaper(
+        loaded=[
+            loaded_model("org/x:2", status="idle"),
+            loaded_model("org/x:3", status="generating"),
+        ]
+    )
+    reaper._last_used["org/x:2"] = time.monotonic()
+    reaper._last_used["org/x:3"] = time.monotonic() - 3600.0
+    assert await reaper.reap_duplicates() == []
+    assert adapter.force_unload_calls == []
+
+
+@pytest.mark.asyncio
+async def test_managed_sweep_keeps_instance_runtime_reports_generating():
+    reaper, adapter = _reaper(
+        loaded=[loaded_model("org/y", size_bytes=10 * _GIB, status="generating")]
+    )
+    reaper.mark_managed("org/y")
+    reaper._last_used["org/y"] = time.monotonic() - 100_000.0
+    await reaper.sweep_loaded()
+    assert adapter.force_unload_calls == []
