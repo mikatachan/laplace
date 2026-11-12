@@ -334,3 +334,43 @@ async def test_govern_waits_for_unload_that_began_after_broker_admit():
     assert adapter.events.index(f"unload-end:{_RACE_MODEL}") < adapter.events.index(
         f"ensure_loaded:{_RACE_MODEL}"
     )
+
+
+@pytest.mark.asyncio
+async def test_admission_waits_for_inflight_duplicate_reap_of_same_base():
+    # Codex review of PR 22: reap_duplicates unloaded a duplicate without the
+    # unloading mark, so a same-base request was admitted and proxied while
+    # force_unload (with its verify/retry) was still running.
+    from tests.fakes import GatedUnloadAdapter
+
+    duplicate = f"{_RACE_MODEL}:2"
+    adapter = GatedUnloadAdapter(
+        loaded=[
+            loaded_model(_RACE_MODEL, size_bytes=20 * _GIB, context_length=131072),
+            loaded_model(duplicate, size_bytes=20 * _GIB, context_length=131072),
+        ],
+        footprints={_RACE_MODEL: 26000},
+    )
+    reaper = Reaper(adapter)
+    broker = ContentionBroker(adapter, reaper, budget_mb=87040, timeout_s=5.0)
+    reaper.mark_managed(_RACE_MODEL)
+    now = time.monotonic()
+    reaper._last_used[_RACE_MODEL] = now - 10.0  # kept: most recently used
+    reaper._last_used[duplicate] = now - 3600.0
+
+    reap = asyncio.create_task(reaper.reap_duplicates())
+    await asyncio.wait_for(adapter.unload_started.wait(), 1.0)
+    request = asyncio.create_task(_govern_and_record(broker, reaper, adapter))
+    await asyncio.sleep(0.05)
+    proxied_mid_unload = [e for e in adapter.events if e.startswith(("proxy", "ensure_loaded"))]
+    adapter.gate.set()
+
+    assert await asyncio.wait_for(request, 2.0) is True
+    assert await asyncio.wait_for(reap, 2.0) == [duplicate]
+    assert proxied_mid_unload == []
+    assert adapter.events == [
+        f"unload-start:{duplicate}",
+        f"unload-end:{duplicate}",
+        f"ensure_loaded:{_RACE_MODEL}",
+        "proxy:admit",
+    ]

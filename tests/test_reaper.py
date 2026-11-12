@@ -405,3 +405,48 @@ async def test_request_free_skips_victim_claimed_during_earlier_unload():
 
     assert adapter.force_unload_calls == ["old/model"]
     assert "new/model" in adapter.loaded
+
+
+@pytest.mark.asyncio
+async def test_reap_duplicates_skips_instance_claimed_during_earlier_unload():
+    # reap_duplicates picks the group's victims up front, then awaits each
+    # unload. An admission that pins the base meanwhile stops the next one.
+    from tests.fakes import GatedUnloadAdapter
+
+    adapter = GatedUnloadAdapter(
+        loaded=[
+            loaded_model("dup/model", size_bytes=10 * _GIB),
+            loaded_model("dup/model:2", size_bytes=10 * _GIB),
+            loaded_model("dup/model:3", size_bytes=10 * _GIB),
+        ]
+    )
+    reaper = Reaper(adapter, delay_seconds=0.0)
+    now = time.monotonic()
+    for model, age in (("dup/model", 10.0), ("dup/model:2", 7200.0), ("dup/model:3", 3600.0)):
+        reaper._last_used[model] = now - age
+
+    task = asyncio.create_task(reaper.reap_duplicates())
+    await asyncio.wait_for(adapter.unload_started.wait(), 1.0)
+    assert reaper.is_unloading("dup/model")
+    reaper.start_loading("dup/model")
+    adapter.gate.set()
+
+    assert await asyncio.wait_for(task, 2.0) == ["dup/model:2"]
+    assert adapter.force_unload_calls == ["dup/model:2"]
+    assert "dup/model:3" in adapter.loaded
+
+
+@pytest.mark.asyncio
+async def test_reap_duplicates_never_unloads_plain_base_while_sibling_kept():
+    # Codex review of #23: the in-flight request was attributed to the suffixed
+    # sibling, so the plain-base instance was picked as the duplicate. A
+    # plain-base request names that identifier, so it must stay.
+    loaded = [
+        loaded_model("txgsync/gpt-oss-120b"),
+        loaded_model("txgsync/gpt-oss-120b:2"),
+    ]
+    reaper, adapter = _reaper(loaded=loaded)
+    reaper.acquire("txgsync/gpt-oss-120b:2")
+    reaped = await reaper.reap_duplicates()
+    assert reaped == []
+    assert adapter.force_unload_calls == []
