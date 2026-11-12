@@ -191,3 +191,46 @@ async def test_force_unload_logs_model_and_reason_at_info(caplog):
     assert [record.message for record in caplog.records] == [
         "lmstudio: unload requested model=some/model reason=reaper:test"
     ]
+
+
+@pytest.mark.asyncio
+async def test_force_unload_plain_base_ignores_kept_sibling_and_does_not_retry():
+    # Codex review of #23: unloading plain "X" while "X:2" stays resident. The
+    # sibling must not count as "still resident", or the retry would issue a
+    # second unload while X:2 serves a request.
+    import json
+
+    adapter = LMStudioAdapter(unload_verify_delay_s=0.0)
+    unloads: list[str] = []
+    sibling = {"identifier": "org/model:2", "modelKey": "org/model", "path": "org/model"}
+
+    async def fake_run(args, timeout):
+        if args[0] == "unload":
+            unloads.append(args[1])
+            return (0, "", "")
+        return (0, json.dumps([sibling]), "")
+
+    adapter._run = fake_run
+    assert await adapter.force_unload("org/model", reason="reaper:duplicate") is True
+    assert unloads == ["org/model"]
+
+
+@pytest.mark.asyncio
+async def test_force_unload_plain_base_still_retries_for_custom_identifier():
+    # A non-sibling instance of the base (custom identifier, same modelKey) still
+    # counts as the victim, as before.
+    import json
+
+    adapter = LMStudioAdapter(unload_verify_delay_s=0.0)
+    unloads: list[str] = []
+    alias = {"identifier": "my-alias", "modelKey": "org/model", "path": "org/model"}
+
+    async def fake_run(args, timeout):
+        if args[0] == "unload":
+            unloads.append(args[1])
+            return (0, "", "")
+        return (0, json.dumps([alias]), "")
+
+    adapter._run = fake_run
+    assert await adapter.force_unload("org/model", reason="reaper:test") is False
+    assert unloads == ["org/model", "org/model"]

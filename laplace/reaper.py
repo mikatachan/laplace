@@ -259,9 +259,14 @@ class Reaper:
             for model_id in instances:
                 if model_id == keep:
                     continue
+                if model_id == base_id:
+                    # A plain-base request names this identifier, and in-flight
+                    # attribution between siblings is a guess
+                    # (_resolve_acquire_model_id), so never reap it as a duplicate.
+                    continue
                 if self._in_flight.get(model_id, 0) > 0:
                     continue
-                unloaded = await self.adapter.force_unload(model_id, reason="reaper:duplicate")
+                unloaded = await self._unload(model_id, reason="reaper:duplicate")
                 if unloaded:
                     reaped.append(model_id)
         return reaped

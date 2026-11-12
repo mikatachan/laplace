@@ -588,9 +588,15 @@ class LMStudioAdapter:
             except ModelLoadError as exc:
                 log.error("lmstudio cannot verify unload of %s: %s", model_id, exc)
                 return False
+            # A same-base sibling (identifier "<base>:N") is never the victim:
+            # matching it here would retry the unload against a kept instance.
             still_loaded = any(
                 self._entry_identifier(entry) == model_id
-                or (model_id == base and self._matches(entry, base))
+                or (
+                    model_id == base
+                    and self._matches(entry, base)
+                    and self.base_id(self._entry_identifier(entry)) != base
+                )
                 for entry in entries
             )
             if not still_loaded:
