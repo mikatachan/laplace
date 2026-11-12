@@ -450,3 +450,73 @@ async def test_reap_duplicates_never_unloads_plain_base_while_sibling_kept():
     reaped = await reaper.reap_duplicates()
     assert reaped == []
     assert adapter.force_unload_calls == []
+
+
+def _stale_attribution_reaper():
+    """Codex review of #23 (d719a11): acquire(X) is booked on a stale X:2 while
+    X:3, now the sole resident instance, serves the request."""
+    reaper, adapter = _reaper(loaded=[loaded_model("org/x:2", size_bytes=10 * _GIB)])
+    reaper.evictable_models(["org/x:2"])  # base index now {org/x:2}
+    adapter.loaded = {"org/x:3": loaded_model("org/x:3", size_bytes=10 * _GIB)}
+    reaper.mark_managed("org/x:3")
+    reaper._last_used["org/x:3"] = time.monotonic() - 100_000.0
+    reaper.acquire("org/x")
+    return reaper, adapter
+
+
+@pytest.mark.asyncio
+async def test_managed_sweep_keeps_instance_when_base_request_booked_on_stale_sibling():
+    reaper, adapter = _stale_attribution_reaper()
+    await reaper.sweep_loaded()
+    assert adapter.force_unload_calls == []
+    assert "org/x:3" in adapter.loaded
+
+
+@pytest.mark.asyncio
+async def test_request_free_keeps_instance_when_base_request_booked_on_stale_sibling():
+    reaper, adapter = _stale_attribution_reaper()
+    assert await reaper.request_free(1024) is False
+    assert adapter.force_unload_calls == []
+
+
+def test_plain_base_request_is_booked_on_plain_instance_when_indexed():
+    reaper, _adapter = _reaper(
+        loaded=[loaded_model("org/x"), loaded_model("org/x:2")]
+    )
+    reaper.evictable_models(["org/x", "org/x:2"])
+    reaper._last_used["org/x:2"] = time.monotonic()
+    reaper._last_used["org/x"] = time.monotonic() - 3600.0
+    reaper.acquire("org/x")
+    assert reaper.in_flight("org/x") == 1
+    assert reaper.in_flight("org/x:2") == 0
+
+
+@pytest.mark.asyncio
+async def test_unload_guard_rechecks_base_when_request_booked_on_stale_sibling():
+    # The sweep picks its victims, then awaits each unload. A base request that
+    # starts meanwhile and is booked on another instance must still stop the
+    # unload of org/x:3. The stale index entry stands in for an instance that
+    # LM Studio replaced between reaper listings.
+    from tests.fakes import GatedUnloadAdapter
+
+    adapter = GatedUnloadAdapter(
+        loaded=[
+            loaded_model("a/old", size_bytes=10 * _GIB),
+            loaded_model("org/x:3", size_bytes=10 * _GIB),
+        ]
+    )
+    reaper = Reaper(adapter)
+    for model in ("a/old", "org/x:3"):
+        reaper.mark_managed(model)
+        reaper._last_used[model] = time.monotonic() - 100_000.0
+
+    sweep = asyncio.create_task(reaper.sweep_loaded())
+    await asyncio.wait_for(adapter.unload_started.wait(), 1.0)
+    reaper._base_index["org/x"] = {"org/x:2"}
+    reaper.acquire("org/x")
+    assert reaper.in_flight("org/x:3") == 0  # booked elsewhere
+    adapter.gate.set()
+    await asyncio.wait_for(sweep, 2.0)
+
+    assert adapter.force_unload_calls == ["a/old"]
+    assert "org/x:3" in adapter.loaded
