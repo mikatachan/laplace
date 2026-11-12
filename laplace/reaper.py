@@ -146,9 +146,7 @@ class Reaper:
         while self._unloading.get(base_id, 0) > 0:
             await self._unload_done[base_id].wait()
 
-    async def _unload(
-        self, model_id: str, *, reason: str, sibling_busy_ok: bool = False
-    ) -> bool:
+    async def _unload(self, model_id: str, *, reason: str) -> bool:
         """Unload ``model_id`` unless an admission has claimed it since selection.
 
         Callers pick victims from a list built before earlier awaits, so the
@@ -159,16 +157,10 @@ class Reaper:
 
         Busy means any request in flight for the model's base, because which
         instance serves a request is not known exactly (see
-        _resolve_acquire_model_id). Only duplicate reaping, which by design
-        unloads an idle sibling of a busy instance, passes ``sibling_busy_ok``.
+        _resolve_acquire_model_id).
         """
         base_id = self.adapter.base_id(model_id)
-        busy = (
-            self._in_flight.get(model_id, 0) > 0
-            if sibling_busy_ok
-            else self._base_in_flight(model_id)
-        )
-        if self._is_loading(model_id) or busy:
+        if self._is_loading(model_id) or self._base_in_flight(model_id):
             log.info(
                 "laplace.reaper: skip unload of %s (%s): claimed by an admission",
                 model_id,
@@ -257,6 +249,7 @@ class Reaper:
         if entries is None:
             entries = await self.adapter.list_loaded()
         groups: dict[str, list[str]] = {}
+        active = {entry.id for entry in entries if entry.id and self._reported_active(entry)}
         for entry in entries:
             if not entry.id:
                 continue
@@ -270,24 +263,21 @@ class Reaper:
                 continue
             if self._is_loading(base_id):
                 continue
-            in_flight_instances = [mid for mid in instances if self._in_flight.get(mid, 0) > 0]
-            if in_flight_instances:
-                keep = max(in_flight_instances, key=self._last_used_at)
-            else:
-                keep = max(instances, key=self._last_used_at)
+            if self._base_in_flight(base_id):
+                # Which sibling serves a request is not known exactly
+                # (_resolve_acquire_model_id guesses), so reap only when idle.
+                continue
+            keep = max(instances, key=self._last_used_at)
             for model_id in instances:
                 if model_id == keep:
                     continue
                 if model_id == base_id:
-                    # A plain-base request names this identifier, and in-flight
-                    # attribution between siblings is a guess
-                    # (_resolve_acquire_model_id), so never reap it as a duplicate.
+                    # A plain-base request names this identifier: never reap it
+                    # as a duplicate.
                     continue
-                if self._in_flight.get(model_id, 0) > 0:
+                if model_id in active:
                     continue
-                unloaded = await self._unload(
-                    model_id, reason="reaper:duplicate", sibling_busy_ok=True
-                )
+                unloaded = await self._unload(model_id, reason="reaper:duplicate")
                 if unloaded:
                     reaped.append(model_id)
         return reaped
@@ -313,6 +303,18 @@ class Reaper:
         if entry.queued:
             return True
         return Reaper._entry_status(entry) != "idle"
+
+    @staticmethod
+    def _reported_active(entry: LoadedModel) -> bool:
+        """Runtime says this instance has work: queued, or a known non-idle status.
+
+        Narrower than reported_busy(): unknown status is not active here, so
+        runtimes that report no status can still be reaped.
+        """
+        if entry.queued:
+            return True
+        status = Reaper._entry_status(entry)
+        return status is not None and status != "idle"
 
     @staticmethod
     def _entry_status(entry: LoadedModel) -> str | None:
@@ -401,6 +403,8 @@ class Reaper:
             if self._base_in_flight(base_id):
                 # Attribution between instances can be stale, so any request
                 # for this base keeps every instance of it.
+                continue
+            if self._reported_active(entry_by_id[model_id]):
                 continue
             last = self._last_used_at(model_id)
             ttl = self._model_ttl(model_id)
