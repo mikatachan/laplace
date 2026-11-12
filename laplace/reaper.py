@@ -154,9 +154,13 @@ class Reaper:
         await between them, and govern() pins with start_loading() before it
         checks is_unloading(). So either this skips the model, or the admission
         waits until the unload, including its retry, has returned.
+
+        Busy means any request in flight for the model's base, because which
+        instance serves a request is not known exactly (see
+        _resolve_acquire_model_id).
         """
         base_id = self.adapter.base_id(model_id)
-        if self._is_loading(model_id) or self._in_flight.get(model_id, 0) > 0:
+        if self._is_loading(model_id) or self._base_in_flight(model_id):
             log.info(
                 "laplace.reaper: skip unload of %s (%s): claimed by an admission",
                 model_id,
@@ -186,6 +190,14 @@ class Reaper:
 
     def in_flight(self, model_id: str) -> int:
         return self._in_flight.get(model_id, 0)
+
+    def _base_in_flight(self, model_id: str) -> bool:
+        """Whether any request is in flight for any instance of this base."""
+        base_id = self.adapter.base_id(model_id)
+        return any(
+            count > 0 and self.adapter.base_id(instance) == base_id
+            for instance, count in self._in_flight.items()
+        )
 
     def mark_managed(self, model_id: str) -> None:
         """Claim a model as daemon-managed before acquire.
@@ -226,8 +238,7 @@ class Reaper:
             model_id
             for model_id in resident
             if model_id
-            and self._in_flight.get(model_id, 0) == 0
-            and self._in_flight.get(self.adapter.base_id(model_id), 0) == 0
+            and not self._base_in_flight(model_id)
             and not self._is_loading(model_id)
             and not self._is_keep_loaded(model_id)
             and not self._is_external(model_id)
@@ -238,6 +249,7 @@ class Reaper:
         if entries is None:
             entries = await self.adapter.list_loaded()
         groups: dict[str, list[str]] = {}
+        active = {entry.id for entry in entries if entry.id and self._reported_active(entry)}
         for entry in entries:
             if not entry.id:
                 continue
@@ -251,20 +263,19 @@ class Reaper:
                 continue
             if self._is_loading(base_id):
                 continue
-            in_flight_instances = [mid for mid in instances if self._in_flight.get(mid, 0) > 0]
-            if in_flight_instances:
-                keep = max(in_flight_instances, key=self._last_used_at)
-            else:
-                keep = max(instances, key=self._last_used_at)
+            if self._base_in_flight(base_id):
+                # Which sibling serves a request is not known exactly
+                # (_resolve_acquire_model_id guesses), so reap only when idle.
+                continue
+            keep = max(instances, key=self._last_used_at)
             for model_id in instances:
                 if model_id == keep:
                     continue
                 if model_id == base_id:
-                    # A plain-base request names this identifier, and in-flight
-                    # attribution between siblings is a guess
-                    # (_resolve_acquire_model_id), so never reap it as a duplicate.
+                    # A plain-base request names this identifier: never reap it
+                    # as a duplicate.
                     continue
-                if self._in_flight.get(model_id, 0) > 0:
+                if model_id in active:
                     continue
                 unloaded = await self._unload(model_id, reason="reaper:duplicate")
                 if unloaded:
@@ -292,6 +303,18 @@ class Reaper:
         if entry.queued:
             return True
         return Reaper._entry_status(entry) != "idle"
+
+    @staticmethod
+    def _reported_active(entry: LoadedModel) -> bool:
+        """Runtime says this instance has work: queued, or a known non-idle status.
+
+        Narrower than reported_busy(): unknown status is not active here, so
+        runtimes that report no status can still be reaped.
+        """
+        if entry.queued:
+            return True
+        status = Reaper._entry_status(entry)
+        return status is not None and status != "idle"
 
     @staticmethod
     def _entry_status(entry: LoadedModel) -> str | None:
@@ -377,9 +400,11 @@ class Reaper:
             base_id = self.adapter.base_id(model_id)
             if self._is_loading(base_id):
                 continue
-            if self._in_flight.get(base_id, 0) > 0 and model_id in self._base_index.get(base_id, {model_id}):
+            if self._base_in_flight(base_id):
+                # Attribution between instances can be stale, so any request
+                # for this base keeps every instance of it.
                 continue
-            if self._in_flight.get(model_id, 0) > 0:
+            if self._reported_active(entry_by_id[model_id]):
                 continue
             last = self._last_used_at(model_id)
             ttl = self._model_ttl(model_id)
@@ -613,7 +638,8 @@ class Reaper:
         if base_id != model_id:
             return model_id
         instances = self._base_index.get(base_id, set())
-        if not instances:
+        if not instances or model_id in instances:
+            # A plain-base request names the plain identifier when it is loaded.
             return model_id
         if len(instances) == 1:
             return next(iter(instances))
