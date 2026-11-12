@@ -146,7 +146,9 @@ class Reaper:
         while self._unloading.get(base_id, 0) > 0:
             await self._unload_done[base_id].wait()
 
-    async def _unload(self, model_id: str, *, reason: str) -> bool:
+    async def _unload(
+        self, model_id: str, *, reason: str, sibling_busy_ok: bool = False
+    ) -> bool:
         """Unload ``model_id`` unless an admission has claimed it since selection.
 
         Callers pick victims from a list built before earlier awaits, so the
@@ -154,9 +156,19 @@ class Reaper:
         await between them, and govern() pins with start_loading() before it
         checks is_unloading(). So either this skips the model, or the admission
         waits until the unload, including its retry, has returned.
+
+        Busy means any request in flight for the model's base, because which
+        instance serves a request is not known exactly (see
+        _resolve_acquire_model_id). Only duplicate reaping, which by design
+        unloads an idle sibling of a busy instance, passes ``sibling_busy_ok``.
         """
         base_id = self.adapter.base_id(model_id)
-        if self._is_loading(model_id) or self._in_flight.get(model_id, 0) > 0:
+        busy = (
+            self._in_flight.get(model_id, 0) > 0
+            if sibling_busy_ok
+            else self._base_in_flight(model_id)
+        )
+        if self._is_loading(model_id) or busy:
             log.info(
                 "laplace.reaper: skip unload of %s (%s): claimed by an admission",
                 model_id,
@@ -186,6 +198,14 @@ class Reaper:
 
     def in_flight(self, model_id: str) -> int:
         return self._in_flight.get(model_id, 0)
+
+    def _base_in_flight(self, model_id: str) -> bool:
+        """Whether any request is in flight for any instance of this base."""
+        base_id = self.adapter.base_id(model_id)
+        return any(
+            count > 0 and self.adapter.base_id(instance) == base_id
+            for instance, count in self._in_flight.items()
+        )
 
     def mark_managed(self, model_id: str) -> None:
         """Claim a model as daemon-managed before acquire.
@@ -226,8 +246,7 @@ class Reaper:
             model_id
             for model_id in resident
             if model_id
-            and self._in_flight.get(model_id, 0) == 0
-            and self._in_flight.get(self.adapter.base_id(model_id), 0) == 0
+            and not self._base_in_flight(model_id)
             and not self._is_loading(model_id)
             and not self._is_keep_loaded(model_id)
             and not self._is_external(model_id)
@@ -266,7 +285,9 @@ class Reaper:
                     continue
                 if self._in_flight.get(model_id, 0) > 0:
                     continue
-                unloaded = await self._unload(model_id, reason="reaper:duplicate")
+                unloaded = await self._unload(
+                    model_id, reason="reaper:duplicate", sibling_busy_ok=True
+                )
                 if unloaded:
                     reaped.append(model_id)
         return reaped
@@ -377,9 +398,9 @@ class Reaper:
             base_id = self.adapter.base_id(model_id)
             if self._is_loading(base_id):
                 continue
-            if self._in_flight.get(base_id, 0) > 0 and model_id in self._base_index.get(base_id, {model_id}):
-                continue
-            if self._in_flight.get(model_id, 0) > 0:
+            if self._base_in_flight(base_id):
+                # Attribution between instances can be stale, so any request
+                # for this base keeps every instance of it.
                 continue
             last = self._last_used_at(model_id)
             ttl = self._model_ttl(model_id)
@@ -613,7 +634,8 @@ class Reaper:
         if base_id != model_id:
             return model_id
         instances = self._base_index.get(base_id, set())
-        if not instances:
+        if not instances or model_id in instances:
+            # A plain-base request names the plain identifier when it is loaded.
             return model_id
         if len(instances) == 1:
             return next(iter(instances))
