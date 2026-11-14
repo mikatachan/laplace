@@ -456,6 +456,48 @@ async def test_non_stream_inspection_commits_safe_or_oversized_bodies(body):
     assert axis_requests == 0
 
 
+@pytest.mark.asyncio
+async def test_stream_json_decoder_recursion_error_passes_through():
+    body = b"[" * 60000 + b"]" * 60000
+    axis_requests = 0
+
+    async def remote_chat(_request):
+        response = web.StreamResponse(
+            headers={"Content-Type": "application/json"}
+        )
+        await response.prepare(_request)
+        await response.write(body[:60000])
+        await response.write(body[60000:])
+        await response.write_eof()
+        return response
+
+    async def axis_chat(_request):
+        nonlocal axis_requests
+        axis_requests += 1
+        return web.json_response({"backend": "axis"})
+
+    remote_app = web.Application()
+    remote_app.router.add_post("/v1/chat/completions", remote_chat)
+    remote_server = await _start(remote_app)
+    axis_app = web.Application()
+    axis_app.router.add_post("/v1/chat/completions", axis_chat)
+    try:
+        async with make_harness(
+            upstream_app=axis_app,
+            config=_config(str(remote_server.make_url("")).rstrip("/")),
+        ) as harness:
+            harness.client.app[FLEET].backends["shinobi"].state = "UP"
+            response = await harness.client.post(
+                "/bot/v1/chat/completions", json={"model": "m", "stream": True}
+            )
+            assert response.status == 200
+            assert await response.read() == body
+    finally:
+        await remote_server.close()
+
+    assert axis_requests == 0
+
+
 @pytest.mark.parametrize("error", [ValueError, RecursionError])
 def test_non_stream_json_decoder_error_does_not_escape(monkeypatch, error):
     def fail_to_decode(_body):
@@ -464,6 +506,12 @@ def test_non_stream_json_decoder_error_does_not_escape(monkeypatch, error):
     monkeypatch.setattr(remote_module.json, "loads", fail_to_decode)
 
     assert remote_module._error_message_from_bytes(b"{}") is None
+
+
+def test_sanitizes_bare_bearer_secret():
+    assert remote_module._sanitize_error_message("Bearer hunter2secret") == (
+        "Bearer [redacted]"
+    )
 
 
 @pytest.mark.asyncio
