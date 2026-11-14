@@ -62,8 +62,8 @@ class LaplacedConfig:
     # Opt-in: admit cold loads by KV-aware cost against live memory headroom
     # (vm_stat) instead of the static [model_footprint_mb] sum.
     live_memory_admission: bool = False
-    # The measured purge overshoot was ~4.4%; 0.05 is the smallest margin
-    # that covers it.
+    # The measured purge shortfall was 4.57% (36002 MiB pool versus 34358 MiB
+    # freed); 0.05 is the smallest margin that covers it in MiB.
     file_cache_reclaim_margin: float = 0.05
     max_concurrent: int = 2
     admit_timeout_s: float = 120.0
