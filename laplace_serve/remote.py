@@ -465,7 +465,7 @@ def _first_json_value(body: bytes) -> tuple[bool, str | None]:
     try:
         text = body.decode("utf-8")
         value, _ = json.JSONDecoder().raw_decode(text.lstrip())
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (UnicodeDecodeError, RecursionError, ValueError):
         return False, None
     return True, _error_message_from_value(value)
 
