@@ -200,6 +200,7 @@ cold load only when its cost fits in live headroom:
 
 ```toml
 live_memory_admission = true
+file_cache_reclaim_margin = 0.10
 ```
 
 - **Cost** = weights + KV + overhead. Weights come from the `lms ls --json`
@@ -209,12 +210,12 @@ live_memory_admission = true
   window; linear-attention layers are skipped) x parallel (`[model_parallel]`).
   Overhead is 10% of weights.
 - **Headroom** is read from `vm_stat` at each decision: free + speculative +
-  the inactive pages that are surely file-backed, minus compressor growth since
-  the previous reading, capped by the room left under `iogpu.wired_limit_mb`.
-  `vm_stat` reports inactive and file-backed as separate totals, so only their
-  guaranteed overlap is counted: `inactive + file-backed - (active + inactive +
-  speculative)`, floored at 0. Anonymous inactive pages need compression to
-  reclaim and are never counted.
+  file-cache credit, minus compressor growth since the previous reading, capped
+  by the room left under `iogpu.wired_limit_mb`. The candidate file pool is
+  `min(active + inactive, max(0, file-backed - speculative))`; subtracting
+  speculative avoids counting it twice. The file-cache credit is that pool
+  multiplied by `1 - file_cache_reclaim_margin` (default `0.10`). To roll back
+  file-cache credit, set `file_cache_reclaim_margin = 1.0` and restart laplaced.
 - **Reserved first**: the full KV a busy resident model can still grow to at
   its loaded context (busy = in flight through laplaced, or `lms ps` reports it
   as not idle, with unknown status, or with queued requests), plus the full
