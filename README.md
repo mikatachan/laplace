@@ -214,8 +214,11 @@ file_cache_reclaim_margin = 0.05
   by the room left under `iogpu.wired_limit_mb`. The candidate file pool is
   `min(active + inactive, max(0, file-backed - speculative))`; subtracting
   speculative avoids counting it twice. The file-cache credit is that pool
-  multiplied by `1 - file_cache_reclaim_margin` (default `0.05`). To roll back
-  file-cache credit, set `file_cache_reclaim_margin = 1.0` and restart laplaced.
+  multiplied by `1 - file_cache_reclaim_margin` (default `0.05`). These values
+  are MiB despite the legacy `*_mb` names. Setting
+  `file_cache_reclaim_margin = 1.0` disables the file-cache credit and is more
+  conservative than pre-PR behaviour, which credited `clean_inactive`; the real
+  rollback is reverting the commit. Restart laplaced after changing it.
 - **Reserved first**: the full KV a busy resident model can still grow to at
   its loaded context (busy = in flight through laplaced, or `lms ps` reports it
   as not idle, with unknown status, or with queued requests), plus the full
