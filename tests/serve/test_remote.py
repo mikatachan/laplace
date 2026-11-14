@@ -36,6 +36,19 @@ def _config(remote_url: str, *, placed: bool = True) -> LaplacedConfig:
     )
 
 
+def _two_model_config(remote_url: str) -> LaplacedConfig:
+    config = _config(remote_url)
+    return LaplacedConfig(
+        **{
+            **config.__dict__,
+            "placement": {
+                "bot:coder": ("shinobi", "axis"),
+                "bot:gemma": ("shinobi", "axis"),
+            },
+        }
+    )
+
+
 async def _start(app: web.Application) -> TestServer:
     server = TestServer(app)
     await server.start_server()
@@ -332,6 +345,269 @@ async def test_precommit_503_falls_back_to_axis():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_inband_error_falls_back_before_commit(stream, caplog):
+    async def remote_chat(request):
+        payload = await request.json()
+        if payload["model"] == "probe-model":
+            return _probe_response()
+        if not stream:
+            return web.json_response({"error": {"message": "context too long"}})
+        response = web.StreamResponse(
+            status=200, headers={"Content-Type": "text/event-stream"}
+        )
+        await response.prepare(request)
+        await response.write(
+            b'data: {"error":{"message":"context too long"}}\n\n'
+        )
+        return response
+
+    async def axis_chat(_request):
+        return web.json_response({"backend": "axis"})
+
+    remote_app = web.Application()
+    remote_app.router.add_post("/v1/chat/completions", remote_chat)
+    remote_server = await _start(remote_app)
+    axis_app = web.Application()
+    axis_app.router.add_post("/v1/chat/completions", axis_chat)
+    caplog.set_level(logging.INFO, logger="laplace_serve.app")
+    try:
+        async with make_harness(
+            upstream_app=axis_app,
+            config=_config(str(remote_server.make_url("")).rstrip("/")),
+        ) as harness:
+            backend = harness.client.app[FLEET].backends["shinobi"]
+            backend.state = "UP"
+            response = await harness.client.post(
+                "/bot/v1/chat/completions", json={"model": "m", "stream": stream}
+            )
+            assert (await response.json()) == {"backend": "axis"}
+            assert backend.snapshot()["models"]["m"] == {
+                "state": "DOWN",
+                "reason": "upstream-inband-error",
+                "consecutive_failures": 1,
+            }
+    finally:
+        await remote_server.close()
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "reason=fallback:upstream-inband-error message=context too long" in message
+        for message in messages
+    )
+    assert not any("reason=served" in message for message in messages)
+
+
+@pytest.mark.asyncio
+async def test_model_failure_does_not_down_another_model():
+    async def remote_chat(request):
+        payload = await request.json()
+        if payload["model"] == "coder":
+            return web.json_response({"error": "coder failed"}, status=503)
+        return web.json_response({"backend": "remote", "model": payload["model"]})
+
+    async def axis_chat(request):
+        payload = await request.json()
+        return web.json_response({"backend": "axis", "model": payload["model"]})
+
+    remote_app = web.Application()
+    remote_app.router.add_post("/v1/chat/completions", remote_chat)
+    remote_server = await _start(remote_app)
+    axis_app = web.Application()
+    axis_app.router.add_post("/v1/chat/completions", axis_chat)
+    try:
+        async with make_harness(
+            upstream_app=axis_app,
+            config=_two_model_config(str(remote_server.make_url("")).rstrip("/")),
+        ) as harness:
+            backend = harness.client.app[FLEET].backends["shinobi"]
+            backend.state = "UP"
+            coder = await harness.client.post(
+                "/bot/v1/chat/completions", json={"model": "coder"}
+            )
+            gemma = await harness.client.post(
+                "/bot/v1/chat/completions", json={"model": "gemma"}
+            )
+            assert (await coder.json())["backend"] == "axis"
+            assert (await gemma.json())["backend"] == "remote"
+            snapshot = backend.snapshot()
+            assert snapshot["state"] == "UP"
+            assert snapshot["models"]["coder"]["state"] == "DOWN"
+            assert snapshot["models"]["gemma"]["state"] == "UP"
+    finally:
+        await remote_server.close()
+
+
+@pytest.mark.asyncio
+async def test_connect_failure_downs_host_for_every_model():
+    class RefusedSession:
+        async def request(self, *_args, **_kwargs):
+            raise aiohttp.ClientConnectionError("mock connection refused")
+
+    backend = RemoteBackend(
+        "shinobi",
+        RemoteBackendConfig(
+            url="http://mock.invalid",
+            probe_model="gemma",
+            auth_command=("stub",),
+        ),
+        active=True,
+    )
+    backend.state = "UP"
+    backend._credential = "test-key"
+    backend._session = RefusedSession()
+    backend.ensure_model("coder")
+    backend.ensure_model("gemma")
+    request = type(
+        "StubRequest",
+        (),
+        {"method": "POST", "headers": {}, "query_string": "", "query": {}},
+    )()
+
+    result = await backend.forward(
+        request, "/v1/chat/completions", b"{}", "coder", False
+    )
+
+    assert result.failure_reason == "connect"
+    assert (backend.state, backend.reason) == ("DOWN", "connect")
+    assert backend.snapshot()["models"]["gemma"]["state"] == "UP"
+
+
+@pytest.mark.asyncio
+async def test_probe_timeout_and_connect_have_distinct_reasons():
+    class FailingContext:
+        def __init__(self, error):
+            self.error = error
+
+        async def __aenter__(self):
+            raise self.error
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class FailingProbeSession:
+        def __init__(self, error):
+            self.error = error
+
+        def post(self, *_args, **_kwargs):
+            return FailingContext(self.error)
+
+    timeout_backend = RemoteBackend(
+        "timeout-host",
+        RemoteBackendConfig(
+            url="http://mock.invalid",
+            probe_model="m",
+            auth_command=("stub",),
+        ),
+        active=True,
+    )
+    timeout_backend.state = "UP"
+    timeout_backend._credential = "test-key"
+    timeout_backend._session = FailingProbeSession(asyncio.TimeoutError())
+    assert await timeout_backend.probe_once() is False
+    assert await timeout_backend.probe_once() is False
+    assert timeout_backend.state == "UP"
+    assert timeout_backend.snapshot()["models"]["m"]["reason"] == "probe-timeout"
+
+    connect_backend = RemoteBackend(
+        "connect-host",
+        RemoteBackendConfig(
+            url="http://mock.invalid",
+            probe_model="m",
+            auth_command=("stub",),
+        ),
+        active=True,
+    )
+    connect_backend.state = "UP"
+    connect_backend._credential = "test-key"
+    connect_backend._session = FailingProbeSession(
+        aiohttp.ClientConnectionError("mock connection refused")
+    )
+    assert await connect_backend.probe_once() is False
+    assert await connect_backend.probe_once() is False
+    assert (connect_backend.state, connect_backend.reason) == (
+        "DOWN",
+        "probe-connect",
+    )
+
+
+def test_two_probe_successes_recover_host_and_model_state():
+    backend = RemoteBackend(
+        "shinobi",
+        RemoteBackendConfig(
+            url="http://mock.invalid",
+            probe_model="gemma",
+            auth_command=("stub",),
+        ),
+        active=True,
+    )
+    backend.state = "UP"
+    backend.record_request_failure("upstream-5xx", "coder")
+    backend.record_request_failure("connect", "gemma", host_wide=True)
+
+    backend.record_probe_success()
+    assert backend.state == "DOWN"
+    assert backend.snapshot()["models"]["coder"]["state"] == "DOWN"
+    backend.record_probe_success()
+
+    assert backend.state == "UP"
+    assert backend.snapshot()["models"]["coder"] == {
+        "state": "UP",
+        "reason": None,
+        "consecutive_failures": 0,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "reason"), [(400, "upstream-400"), (503, "upstream-5xx")]
+)
+async def test_upstream_error_log_is_sanitized_and_truncated(
+    status, reason, caplog
+):
+    secret = "secret-token-value-that-must-never-appear"
+    long_tail = "ordinary upstream detail " * 20
+
+    async def remote_chat(_request):
+        return web.json_response(
+            {"error": f"bad\nAuthorization: Bearer {secret} {long_tail}"},
+            status=status,
+        )
+
+    async def axis_chat(_request):
+        return web.json_response({"backend": "axis"})
+
+    remote_app = web.Application()
+    remote_app.router.add_post("/v1/chat/completions", remote_chat)
+    remote_server = await _start(remote_app)
+    axis_app = web.Application()
+    axis_app.router.add_post("/v1/chat/completions", axis_chat)
+    caplog.set_level(logging.INFO, logger="laplace_serve.app")
+    try:
+        async with make_harness(
+            upstream_app=axis_app,
+            config=_config(str(remote_server.make_url("")).rstrip("/")),
+        ) as harness:
+            harness.client.app[FLEET].backends["shinobi"].state = "UP"
+            response = await harness.client.post(
+                "/bot/v1/chat/completions", json={"model": "m"}
+            )
+            assert (await response.json())["backend"] == "axis"
+    finally:
+        await remote_server.close()
+
+    fallback = next(
+        record.getMessage()
+        for record in caplog.records
+        if f"reason=fallback:{reason}" in record.getMessage()
+    )
+    assert secret not in fallback
+    assert "\n" not in fallback
+    assert "Authorization=[redacted]" in fallback
+    assert fallback.endswith("...")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("remote_status", [400, 404, 429])
 async def test_client_status_falls_back_without_marking_remote_down(remote_status):
     async def remote_chat(request):
@@ -574,7 +850,9 @@ async def test_cancelled_slot_wait_does_not_leak_queued_counter():
         (),
         {"method": "POST", "headers": {}, "query_string": "", "query": {}},
     )()
-    task = asyncio.create_task(backend.forward(request, "/v1/chat/completions", b"{}"))
+    task = asyncio.create_task(
+        backend.forward(request, "/v1/chat/completions", b"{}", "m", False)
+    )
     try:
         while backend.queued == 0:
             await asyncio.sleep(0)
