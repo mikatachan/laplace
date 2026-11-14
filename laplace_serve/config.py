@@ -62,6 +62,9 @@ class LaplacedConfig:
     # Opt-in: admit cold loads by KV-aware cost against live memory headroom
     # (vm_stat) instead of the static [model_footprint_mb] sum.
     live_memory_admission: bool = False
+    # The measured candidate file pool exceeded memory actually freed by ~4.4%;
+    # 0.10 covers that with room.
+    file_cache_reclaim_margin: float = 0.10
     max_concurrent: int = 2
     admit_timeout_s: float = 120.0
     fail_open: bool = True
@@ -166,6 +169,15 @@ class LaplacedConfig:
             raw["live_memory_admission"], bool
         ):
             raise ValueError("laplaced config: live_memory_admission must be a boolean")
+        margin = raw.get("file_cache_reclaim_margin", 0.10)
+        if (
+            isinstance(margin, bool)
+            or not isinstance(margin, (int, float))
+            or not 0 <= margin <= 1
+        ):
+            raise ValueError(
+                "laplaced config: file_cache_reclaim_margin must be between 0 and 1"
+            )
 
         origins = dict(raw.pop("origins", None) or dict(_DEFAULT_ORIGINS))
         caller_verifiers = _coerce_string_map(
