@@ -62,6 +62,9 @@ class LaplacedConfig:
     # Opt-in: admit cold loads by KV-aware cost against live memory headroom
     # (vm_stat) instead of the static [model_footprint_mb] sum.
     live_memory_admission: bool = False
+    # Default-off per-load parallel sizing. Requires live-memory admission and
+    # treats [model_parallel] values as ceilings.
+    dynamic_load_sizing: bool = False
     max_concurrent: int = 2
     admit_timeout_s: float = 120.0
     fail_open: bool = True
@@ -166,6 +169,14 @@ class LaplacedConfig:
             raw["live_memory_admission"], bool
         ):
             raise ValueError("laplaced config: live_memory_admission must be a boolean")
+        if "dynamic_load_sizing" in raw and not isinstance(
+            raw["dynamic_load_sizing"], bool
+        ):
+            raise ValueError("laplaced config: dynamic_load_sizing must be a boolean")
+        if raw.get("dynamic_load_sizing") and not raw.get("live_memory_admission"):
+            raise ValueError(
+                "laplaced config: dynamic_load_sizing requires live_memory_admission"
+            )
 
         origins = dict(raw.pop("origins", None) or dict(_DEFAULT_ORIGINS))
         caller_verifiers = _coerce_string_map(

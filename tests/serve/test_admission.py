@@ -41,6 +41,21 @@ class _BackpressureBroker:
         return None
 
 
+class _ParallelBroker:
+    dynamic_load_sizing = True
+
+    async def admit(self, *_args, **_kwargs):
+        return "admit", 2
+
+    async def done(self, *_args, **_kwargs):
+        return None
+
+
+class _ParallelAdapter(FakeAdapter):
+    async def ensure_loaded(self, model_id, context_length, parallel=None):
+        await super().ensure_loaded(model_id, context_length, parallel)
+
+
 def _resident_adapter(cls=FakeAdapter):
     return cls(
         loaded=[loaded_model(_MODEL, size_bytes=40 * _GIB)],
@@ -58,6 +73,18 @@ async def test_backpressure_does_not_proxy():
     ) as adm:
         assert adm.decision == "backpressure"
         assert adm.proxy is False
+
+
+@pytest.mark.asyncio
+async def test_govern_passes_selected_parallel_to_adapter():
+    adapter = _ParallelAdapter()
+    reaper = Reaper(adapter)
+    async with govern(
+        _ParallelBroker(), reaper, adapter,
+        model=_MODEL, ctx=131072, tier="interactive", fail_open=True,
+    ) as adm:
+        assert adm.decision == "admit"
+    assert adapter.ensure_loaded_parallel_calls == [(_MODEL, 131072, 2)]
 
 
 @pytest.mark.asyncio
