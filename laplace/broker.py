@@ -30,11 +30,20 @@ class ContentionBroker:
         timeout_s: float = DEFAULT_TIMEOUT_S,
         max_concurrent_lms: int = DEFAULT_MAX_CONCURRENT_LMS,
         headroom_mb: Optional[Callable[[], Awaitable[Optional[int]]]] = None,
+        fit_context: bool = False,
+        measured_eviction: bool = False,
     ):
         """``headroom_mb`` enables live-memory admission: a cold load must fit
         in the live headroom it returns, after reserving KV growth for busy
         resident models and the full cost of admitted loads still pending.
-        Without it, admission uses the static footprint budget."""
+        Without it, admission uses the static footprint budget.
+
+        Both flags below apply only to live-memory admission.
+        ``fit_context``: when the configured context does not fit, load at the
+        largest context that does, if that still covers the job's need (see
+        ``admit_sized``). ``measured_eviction``: once per admission, evict
+        idle victims even when their estimated credit is below the shortfall,
+        then decide again on the measured headroom."""
         self._adapter = adapter
         self._reaper = reaper
         self._budget_override = budget_mb
@@ -48,6 +57,8 @@ class ContentionBroker:
         self._footprint_cache: dict[str, int | None] = {}
         self._headroom = headroom_mb
         self._reserved_ctx: dict[str, int | None] = {}
+        self._fit_context = fit_context
+        self._measured_eviction = measured_eviction
         self._reaper.set_broker(self)
 
     async def admit(
@@ -56,8 +67,32 @@ class ContentionBroker:
         context_length: int | None = None,
         priority: str = "scheduled",
     ) -> str:
+        decision, _ = await self.admit_sized(model_id, context_length, priority)
+        return decision
+
+    async def admit_sized(
+        self,
+        model_id: str,
+        context_length: int | None = None,
+        priority: str = "scheduled",
+        *,
+        need_context: int | None = None,
+    ) -> tuple[str, int | None]:
+        """Admit like ``admit`` and also return the context to load or reuse at.
+
+        ``context_length`` is the configured context. ``need_context`` is the
+        job's own estimate (prompt plus output allowance). With ``fit_context``
+        on and a need given, a load that does not fit at the configured
+        context is admitted at the largest context that fits, if that covers
+        the need. Without them the returned context is ``context_length``.
+        """
         if not model_id:
-            return "admit"
+            return "admit", context_length
+        if not (self._fit_context and need_context and context_length):
+            need_context = None
+        elif need_context > context_length:
+            # More than configured: today's behaviour, the configured context.
+            need_context = context_length
         try:
             tier = from_legacy_string(priority)
         except ValueError:
@@ -71,6 +106,9 @@ class ContentionBroker:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self._timeout
         evicted_this_cycle = False
+        # One measured (credit < shortfall) eviction per admission, ever, so a
+        # request cannot evict, fail to fit, and evict again on its next wake.
+        measured_eviction_used = False
 
         while True:
             async with self._lock:
@@ -79,13 +117,22 @@ class ContentionBroker:
                     tier,
                     allow_evict=not evicted_this_cycle,
                     context_length=context_length,
+                    need_context=need_context,
+                    allow_measured_eviction=(
+                        self._measured_eviction and not measured_eviction_used
+                    ),
                 )
                 queued_for_unload = decision is None and self._reaper.is_unloading(model_id)
                 if decision == "admit":
                     self._wake()
-                    return "admit"
+                    return "admit", context_length
+                if isinstance(decision, tuple) and decision[0] == "admit":
+                    self._wake()
+                    return "admit", decision[1]
                 if isinstance(decision, tuple) and decision[0] == "evict":
-                    _, needed_mb, evict_prio = decision
+                    _, needed_mb, evict_prio = decision[:3]
+                    if len(decision) > 3 and decision[3]:
+                        measured_eviction_used = True
                 else:
                     needed_mb = None
                     evict_prio = None
@@ -104,7 +151,7 @@ class ContentionBroker:
             async with self._lock:
                 remaining = deadline - loop.time()
                 if remaining <= 0:
-                    return "backpressure"
+                    return "backpressure", None
                 if queued_for_unload and not self._reaper.is_unloading(model_id):
                     # The unload ended before we parked, so its wake found no
                     # waiter. Re-evaluate now instead of waiting for another.
@@ -121,7 +168,7 @@ class ContentionBroker:
             except asyncio.TimeoutError:
                 async with self._lock:
                     self._remove_waiter(entry)
-                return "backpressure"
+                return "backpressure", None
             except asyncio.CancelledError:
                 # The admit() task was cancelled while parked on the heap. Without
                 # this cleanup the entry lingers in self._waiters until a later
@@ -203,9 +250,18 @@ class ContentionBroker:
         *,
         allow_evict: bool = True,
         context_length: int | None = None,
+        need_context: int | None = None,
+        allow_measured_eviction: bool = False,
     ):
         if self._headroom is not None and hasattr(self._adapter, "load_cost"):
-            return await self._try_admit_live(model_id, priority, allow_evict, context_length)
+            return await self._try_admit_live(
+                model_id,
+                priority,
+                allow_evict,
+                context_length,
+                need_context,
+                allow_measured_eviction,
+            )
         footprint = await self._footprint_mb(model_id)
         if self._unload_in_progress(model_id, context_length):
             return None
@@ -249,6 +305,8 @@ class ContentionBroker:
         priority: PriorityTier,
         allow_evict: bool,
         context_length: int | None,
+        need_context: int | None = None,
+        allow_measured_eviction: bool = False,
     ):
         if self._active_calls() >= self._max_concurrent:
             return None
@@ -256,17 +314,40 @@ class ContentionBroker:
         resident = [entry.id for entry in entries]
         if self._unload_in_progress(model_id, context_length):
             return None
-        covered = self._covered_by_existing(model_id, context_length, entries)
+        # With fit-sized context an instance only has to cover the job's need.
+        required_ctx = need_context or context_length
+        covered = self._covered_by_existing(model_id, required_ctx, entries)
         if covered == "admit":
             # No new load: an instance at this context is resident or pending.
-            self._reserve(model_id, context_length)
-            return "admit"
+            self._reserve(model_id, required_ctx)
+            if not need_context:
+                return "admit"
+            log.info(
+                "laplace.broker: load decision model=%s need_ctx=%s configured_ctx=%s "
+                "decision=admit reason=covered-by-existing-instance",
+                model_id,
+                need_context,
+                context_length,
+            )
+            return ("admit", required_ctx)
         if covered == "wait":
             log.info(
                 "laplace.broker: load decision model=%s ctx=%s decision=queue "
                 "reason=pending-load-at-smaller-context",
                 model_id,
-                context_length,
+                required_ctx,
+            )
+            return None
+        if need_context and any(self._same_model(model_id, entry.id) for entry in entries):
+            # A resident instance below the need cannot serve this job, and a
+            # second instance would be refused as a duplicate load. Wait for
+            # the reaper's idle unload; it wakes this queue.
+            log.info(
+                "laplace.broker: load decision model=%s need_ctx=%s decision=queue "
+                "reason=resident-at-smaller-context resident_ctx=%s",
+                model_id,
+                need_context,
+                [entry.context_length for entry in entries if self._same_model(model_id, entry.id)],
             )
             return None
 
@@ -295,6 +376,8 @@ class ContentionBroker:
         estimate = (*cost.estimate, *inflight_estimate, *pending_estimate)
 
         def note(decision: str, **extra) -> None:
+            if need_context:
+                extra = {"configured_ctx": context_length, "need_ctx": need_context, **extra}
             log.info(
                 "laplace.broker: load decision model=%s ctx=%s parallel=%s cost_mb=%s "
                 "(weights=%s kv=%s overhead=%s) headroom_mb=%s inflight_reserve_mb=%s "
@@ -318,7 +401,22 @@ class ContentionBroker:
         if cost.total_mb <= available:
             note("admit")
             self._reserve(model_id, context_length)
-            return "admit"
+            return ("admit", context_length) if need_context else "admit"
+
+        if need_context:
+            fit_ctx = await self._fit_context_length(
+                model_id, available, need_context, context_length
+            )
+            if fit_ctx is not None:
+                cost = await self._adapter.load_cost(model_id, fit_ctx)
+                note("admit", fit_ctx=fit_ctx)
+                self._reserve(model_id, fit_ctx)
+                return ("admit", fit_ctx)
+            # Evict for the job's need only; the recheck after eviction sizes
+            # the load to whatever the measured headroom then allows.
+            need_cost = await self._adapter.load_cost(model_id, need_context)
+            if need_cost is not None:
+                cost = need_cost
 
         shortfall = cost.total_mb - available
         evictable_ids = set(self._reaper.evictable_models(resident))
@@ -333,11 +431,42 @@ class ContentionBroker:
             victim = await self._adapter.load_cost(entry.id, entry.context_length)
             if victim is not None:
                 credit += victim.weights_mb + victim.overhead_mb
-        if credit < shortfall or not allow_evict:
+        if not allow_evict:
             note("queue", shortfall_mb=shortfall, evictable_credit_mb=credit)
             return None
-        note("evict", shortfall_mb=shortfall, evictable_credit_mb=credit)
-        return ("evict", shortfall, priority)
+        if credit >= shortfall:
+            note("evict", shortfall_mb=shortfall, evictable_credit_mb=credit)
+            return ("evict", shortfall, priority)
+        if allow_measured_eviction and evictable:
+            # The credit omits KV and allocator memory a victim releases, so
+            # measure instead of predicting: evict once, then decide again on
+            # live headroom. Same victims as above: idle, managed, unreserved.
+            note("evict-measured", shortfall_mb=shortfall, evictable_credit_mb=credit)
+            return ("evict", shortfall, priority, True)
+        note("queue", shortfall_mb=shortfall, evictable_credit_mb=credit)
+        return None
+
+    async def _fit_context_length(
+        self, model_id: str, available_mb: int, need: int, ceiling: int
+    ) -> int | None:
+        """Largest context in [need, ceiling] whose load cost fits ``available_mb``.
+
+        Bisects on the adapter's own ``load_cost``, so sliding-window layers
+        and parallel are priced exactly as at load time. Cost never falls as
+        context grows. None when even ``need`` does not fit.
+        """
+        low_cost = await self._adapter.load_cost(model_id, need)
+        if low_cost is None or low_cost.total_mb > available_mb:
+            return None
+        low, high = need, ceiling
+        while low < high:
+            mid = (low + high + 1) // 2
+            mid_cost = await self._adapter.load_cost(model_id, mid)
+            if mid_cost is not None and mid_cost.total_mb <= available_mb:
+                low = mid
+            else:
+                high = mid - 1
+        return low
 
     def _unload_in_progress(self, model_id: str, context_length: int | None) -> bool:
         """Queue a request whose model the reaper is unloading right now.
