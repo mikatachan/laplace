@@ -450,7 +450,7 @@ def test_parse_vm_stat():
 
 @pytest.mark.asyncio
 async def test_vm_stat_headroom_counts_file_cache_and_compressor_growth():
-    # File pool = min(100 + 512, 600 - 64) = 536; default margin credits 482 pages.
+    # File pool = min(100 + 512, 600 - 64) = 536; default margin credits 509 pages.
     state = dict(active=100, inactive=512, speculative=64, file=600)
     outputs = {
         "vm_stat": [_vm(compressor=100, **state), _vm(compressor=100 + 640, **state)],
@@ -476,7 +476,7 @@ async def test_vm_stat_headroom_measured_sample_and_margin():
     async def run(args):
         return text if args[0] == "vm_stat" else "0\n"
 
-    assert await VmStatHeadroom(run=run)() == 60340
+    assert await VmStatHeadroom(run=run)() == 62140
 
 
 @pytest.mark.asyncio
@@ -512,10 +512,10 @@ def test_live_memory_admission_is_opt_in():
     assert default._headroom is None
     _, _, live = build_components(LaplacedConfig.from_dict({"live_memory_admission": True}))
     assert isinstance(live._headroom, VmStatHeadroom)
-    assert live._headroom._file_cache_reclaim_margin == 0.10
+    assert live._headroom._file_cache_reclaim_margin == 0.05
     with pytest.raises(ValueError):
         LaplacedConfig.from_dict({"live_memory_admission": "yes"})
-    assert LaplacedConfig().file_cache_reclaim_margin == 0.10
+    assert LaplacedConfig().file_cache_reclaim_margin == 0.05
     for margin in (-0.01, 1.01):
         with pytest.raises(ValueError, match="file_cache_reclaim_margin"):
             LaplacedConfig.from_dict({"file_cache_reclaim_margin": margin})

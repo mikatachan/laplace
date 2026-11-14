@@ -200,7 +200,7 @@ cold load only when its cost fits in live headroom:
 
 ```toml
 live_memory_admission = true
-file_cache_reclaim_margin = 0.10
+file_cache_reclaim_margin = 0.05
 ```
 
 - **Cost** = weights + KV + overhead. Weights come from the `lms ls --json`
@@ -214,7 +214,7 @@ file_cache_reclaim_margin = 0.10
   by the room left under `iogpu.wired_limit_mb`. The candidate file pool is
   `min(active + inactive, max(0, file-backed - speculative))`; subtracting
   speculative avoids counting it twice. The file-cache credit is that pool
-  multiplied by `1 - file_cache_reclaim_margin` (default `0.10`). To roll back
+  multiplied by `1 - file_cache_reclaim_margin` (default `0.05`). To roll back
   file-cache credit, set `file_cache_reclaim_margin = 1.0` and restart laplaced.
 - **Reserved first**: the full KV a busy resident model can still grow to at
   its loaded context (busy = in flight through laplaced, or `lms ps` reports it

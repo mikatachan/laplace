@@ -67,7 +67,7 @@ class VmStatHeadroom:
     """
 
     def __init__(
-        self, run: Runner | None = None, file_cache_reclaim_margin: float = 0.10
+        self, run: Runner | None = None, file_cache_reclaim_margin: float = 0.05
     ):
         self._run = run or _run
         self._file_cache_reclaim_margin = file_cache_reclaim_margin
