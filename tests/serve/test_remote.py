@@ -294,11 +294,18 @@ async def test_probe_timeout_is_cold_when_not_up_and_short_when_up(monkeypatch):
         await backend.probe_once()  # second success flips to UP
         assert backend.state == "UP"
         await backend.probe_once()  # UP -> short timeout
+        backend._set_model_state("probe-model", "DOWN", "request-failure")
+        await backend.probe_once()  # a DOWN probe model may need a cold load
     finally:
         await backend.close()
         await server.close()
 
-    assert totals == [PROBE_COLD_TIMEOUT_S, PROBE_COLD_TIMEOUT_S, PROBE_TIMEOUT_S]
+    assert totals == [
+        PROBE_COLD_TIMEOUT_S,
+        PROBE_COLD_TIMEOUT_S,
+        PROBE_TIMEOUT_S,
+        PROBE_COLD_TIMEOUT_S,
+    ]
 
 
 @pytest.mark.asyncio
@@ -347,10 +354,16 @@ async def test_precommit_503_falls_back_to_axis():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [False, True])
 async def test_inband_error_falls_back_before_commit(stream, caplog):
+    remote_requests = 0
+
     async def remote_chat(request):
+        nonlocal remote_requests
         payload = await request.json()
         if payload["model"] == "probe-model":
             return _probe_response()
+        remote_requests += 1
+        if remote_requests > 1:
+            return web.json_response({"backend": "remote"})
         if not stream:
             return web.json_response({"error": {"message": "context too long"}})
         response = web.StreamResponse(
@@ -383,10 +396,14 @@ async def test_inband_error_falls_back_before_commit(stream, caplog):
             )
             assert (await response.json()) == {"backend": "axis"}
             assert backend.snapshot()["models"]["m"] == {
-                "state": "DOWN",
-                "reason": "upstream-inband-error",
-                "consecutive_failures": 1,
+                "state": "UP",
+                "reason": None,
+                "consecutive_failures": 0,
             }
+            retry = await harness.client.post(
+                "/bot/v1/chat/completions", json={"model": "m"}
+            )
+            assert (await retry.json()) == {"backend": "remote"}
     finally:
         await remote_server.close()
 
@@ -395,14 +412,69 @@ async def test_inband_error_falls_back_before_commit(stream, caplog):
         "reason=fallback:upstream-inband-error message=context too long" in message
         for message in messages
     )
-    assert not any("reason=served" in message for message in messages)
+    assert sum("reason=served" in message for message in messages) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"choices":[{"message":{"content":"hi"}}],"error":null}',
+        b'{"error":"' + b"x" * (64 * 1024) + b'"}',
+    ],
+    ids=["error-null", "large-body"],
+)
+async def test_non_stream_inspection_commits_safe_or_oversized_bodies(body):
+    axis_requests = 0
+
+    async def remote_chat(_request):
+        return web.Response(body=body, content_type="application/json")
+
+    async def axis_chat(_request):
+        nonlocal axis_requests
+        axis_requests += 1
+        return web.json_response({"backend": "axis"})
+
+    remote_app = web.Application()
+    remote_app.router.add_post("/v1/chat/completions", remote_chat)
+    remote_server = await _start(remote_app)
+    axis_app = web.Application()
+    axis_app.router.add_post("/v1/chat/completions", axis_chat)
+    try:
+        async with make_harness(
+            upstream_app=axis_app,
+            config=_config(str(remote_server.make_url("")).rstrip("/")),
+        ) as harness:
+            harness.client.app[FLEET].backends["shinobi"].state = "UP"
+            response = await harness.client.post(
+                "/bot/v1/chat/completions", json={"model": "m"}
+            )
+            assert await response.read() == body
+    finally:
+        await remote_server.close()
+
+    assert axis_requests == 0
+
+
+@pytest.mark.parametrize("error", [ValueError, RecursionError])
+def test_non_stream_json_decoder_error_does_not_escape(monkeypatch, error):
+    def fail_to_decode(_body):
+        raise error("mock decoder failure")
+
+    monkeypatch.setattr(remote_module.json, "loads", fail_to_decode)
+
+    assert remote_module._error_message_from_bytes(b"{}") is None
 
 
 @pytest.mark.asyncio
 async def test_model_failure_does_not_down_another_model():
+    coder_requests = 0
+
     async def remote_chat(request):
+        nonlocal coder_requests
         payload = await request.json()
         if payload["model"] == "coder":
+            coder_requests += 1
             return web.json_response({"error": "coder failed"}, status=503)
         return web.json_response({"backend": "remote", "model": payload["model"]})
 
@@ -425,10 +497,14 @@ async def test_model_failure_does_not_down_another_model():
             coder = await harness.client.post(
                 "/bot/v1/chat/completions", json={"model": "coder"}
             )
+            coder_retry = await harness.client.post(
+                "/bot/v1/chat/completions", json={"model": "coder"}
+            )
             gemma = await harness.client.post(
                 "/bot/v1/chat/completions", json={"model": "gemma"}
             )
             assert (await coder.json())["backend"] == "axis"
+            assert (await coder_retry.json())["backend"] == "axis"
             assert (await gemma.json())["backend"] == "remote"
             snapshot = backend.snapshot()
             assert snapshot["state"] == "UP"
@@ -436,6 +512,8 @@ async def test_model_failure_does_not_down_another_model():
             assert snapshot["models"]["gemma"]["state"] == "UP"
     finally:
         await remote_server.close()
+
+    assert coder_requests == 1
 
 
 @pytest.mark.asyncio
@@ -506,8 +584,10 @@ async def test_probe_timeout_and_connect_have_distinct_reasons():
     timeout_backend._session = FailingProbeSession(asyncio.TimeoutError())
     assert await timeout_backend.probe_once() is False
     assert await timeout_backend.probe_once() is False
-    assert timeout_backend.state == "UP"
-    assert timeout_backend.snapshot()["models"]["m"]["reason"] == "probe-timeout"
+    assert (timeout_backend.state, timeout_backend.reason) == (
+        "DOWN",
+        "probe-timeout",
+    )
 
     connect_backend = RemoteBackend(
         "connect-host",
@@ -529,6 +609,135 @@ async def test_probe_timeout_and_connect_have_distinct_reasons():
         "DOWN",
         "probe-connect",
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "reason"),
+    [
+        ("http", "probe-http"),
+        ("body", "probe-body"),
+        ("auth", "auth"),
+    ],
+)
+async def test_probe_response_failures_down_the_host(failure, reason):
+    async def chat(_request):
+        if failure == "http":
+            return web.Response(status=503)
+        if failure == "body":
+            return web.Response(text="not json", content_type="application/json")
+        return web.Response(status=401)
+
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", chat)
+    server = await _start(app)
+    backend = RemoteBackend(
+        "shinobi",
+        RemoteBackendConfig(
+            url=str(server.make_url("")).rstrip("/"),
+            probe_model="probe-model",
+            auth_command=("stub",),
+        ),
+        active=True,
+    )
+    backend.state = "UP"
+    backend._credential = "test-key"
+    backend._session = aiohttp.ClientSession()
+
+    async def refresh_credential():
+        backend._credential = "test-key"
+        return True
+
+    backend._refresh_credential = refresh_credential
+    try:
+        assert await backend.probe_once() is False
+        assert backend.state == "UP"
+        assert await backend.probe_once() is False
+        assert (backend.state, backend.reason) == ("DOWN", reason)
+    finally:
+        await backend.close()
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_probe_all_urls_failed_cannot_leave_host_up():
+    primary_calls = 0
+    alternate_calls = 0
+
+    async def primary(_request):
+        nonlocal primary_calls
+        primary_calls += 1
+        return web.Response(status=503)
+
+    async def alternate(_request):
+        nonlocal alternate_calls
+        alternate_calls += 1
+        return web.Response(text="not json", content_type="application/json")
+
+    primary_app = web.Application()
+    primary_app.router.add_post("/v1/chat/completions", primary)
+    alternate_app = web.Application()
+    alternate_app.router.add_post("/v1/chat/completions", alternate)
+    primary_server = await _start(primary_app)
+    alternate_server = await _start(alternate_app)
+    backend = RemoteBackend(
+        "shinobi",
+        RemoteBackendConfig(
+            url=str(primary_server.make_url("")).rstrip("/"),
+            alt_urls=(str(alternate_server.make_url("")).rstrip("/"),),
+            probe_model="probe-model",
+            auth_command=("stub",),
+        ),
+        active=True,
+    )
+    backend.state = "UP"
+    backend._credential = "test-key"
+    backend._session = aiohttp.ClientSession()
+    try:
+        assert await backend.probe_once() is False
+        assert await backend.probe_once() is False
+        assert (backend.state, backend.reason) == ("DOWN", "probe-body")
+        assert (primary_calls, alternate_calls) == (2, 2)
+    finally:
+        await backend.close()
+        await primary_server.close()
+        await alternate_server.close()
+
+
+@pytest.mark.asyncio
+async def test_probe_loop_survives_unexpected_exception(monkeypatch, caplog):
+    backend = RemoteBackend(
+        "shinobi",
+        RemoteBackendConfig(
+            url="http://mock.invalid",
+            probe_model="probe-model",
+            auth_command=("stub",),
+        ),
+        active=True,
+    )
+    backend.state = "UP"
+    calls = 0
+
+    async def probe_once():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ValueError("mock unexpected probe failure")
+        raise asyncio.CancelledError
+
+    async def no_delay(_seconds):
+        return None
+
+    backend.probe_once = probe_once
+    monkeypatch.setattr(remote_module.asyncio, "sleep", no_delay)
+    caplog.set_level(logging.ERROR, logger="laplace_serve.remote")
+
+    with pytest.raises(asyncio.CancelledError):
+        await backend._probe_loop()
+
+    assert calls == 2
+    assert backend.consecutive_failures == 1
+    assert "probe failed unexpectedly" in caplog.text
 
 
 def test_two_probe_successes_recover_host_and_model_state():
@@ -565,12 +774,18 @@ def test_two_probe_successes_recover_host_and_model_state():
 async def test_upstream_error_log_is_sanitized_and_truncated(
     status, reason, caplog
 ):
-    secret = "secret-token-value-that-must-never-appear"
+    secret = "hunter2secret"
+    bearer_secret = "sk-lm-Ab12Cd34:Ef56Gh78Ij90Kl12Mn34"
     long_tail = "ordinary upstream detail " * 20
 
     async def remote_chat(_request):
         return web.json_response(
-            {"error": f"bad\nAuthorization: Bearer {secret} {long_tail}"},
+            {
+                "error": (
+                    f"bad\npassword: {secret} \x1b[31m"
+                    f"Authorization: Bearer {bearer_secret}\x1b[0m {long_tail}"
+                )
+            },
             status=status,
         )
 
@@ -602,6 +817,8 @@ async def test_upstream_error_log_is_sanitized_and_truncated(
         if f"reason=fallback:{reason}" in record.getMessage()
     )
     assert secret not in fallback
+    assert bearer_secret not in fallback
+    assert "\x1b" not in fallback
     assert "\n" not in fallback
     assert "Authorization=[redacted]" in fallback
     assert fallback.endswith("...")
