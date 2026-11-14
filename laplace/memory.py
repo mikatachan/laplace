@@ -58,21 +58,19 @@ def parse_vm_stat(text: str) -> dict[str, int]:
 class VmStatHeadroom:
     """Callable returning live headroom in MB, or ``None`` when unreadable.
 
-    Headroom is memory a new load can take without forcing compression or swap:
-    free + speculative pages + inactive pages that are surely file-backed
-    (anonymous inactive pages are reclaimed only by compressing them).
-    vm_stat reports inactive and file-backed as separate totals over the same
-    pageable pages (active + inactive + speculative == file-backed + anonymous),
-    so their overlap is only bounded below:
-    inactive + file_backed - (active + inactive + speculative), floored at 0.
-    That lower bound is what is counted. Growth
-    in compressor occupancy since the previous reading is subtracted as active
-    pressure. When ``iogpu.wired_limit_mb`` is set, headroom is also capped by
-    the room left under that limit, since model memory is GPU-wired.
+    Headroom is free + speculative pages + reclaimable file-backed pages, less
+    a safety margin on the file-cache credit and compressor growth since the
+    previous reading. Speculative pages are removed from the file-backed pool
+    because they are already counted directly. When ``iogpu.wired_limit_mb``
+    is set, headroom is also capped by the room left under that limit, since
+    model memory is GPU-wired.
     """
 
-    def __init__(self, run: Runner | None = None):
+    def __init__(
+        self, run: Runner | None = None, file_cache_reclaim_margin: float = 0.05
+    ):
         self._run = run or _run
+        self._file_cache_reclaim_margin = file_cache_reclaim_margin
         self._last_compressor_pages: int | None = None
 
     async def __call__(self) -> int | None:
@@ -98,13 +96,33 @@ class VmStatHeadroom:
             growth = max(0, compressor - self._last_compressor_pages)
         self._last_compressor_pages = compressor
 
-        pageable = active + inactive + speculative
-        clean_inactive = min(inactive, max(0, inactive + file_backed - pageable))
-        reclaimable = free + speculative + clean_inactive - growth
+        reclaimable_file = min(active + inactive, max(0, file_backed - speculative))
+        file_credit = int(
+            reclaimable_file * (1.0 - self._file_cache_reclaim_margin)
+        )
+        file_margin = reclaimable_file - file_credit
+        reclaimable = free + speculative + file_credit - growth
         headroom_mb = reclaimable * page // _MIB
 
         limit_text = await self._run(["sysctl", "-n", "iogpu.wired_limit_mb"])
         limit = (limit_text or "").strip()
+        wired_cap_mb: int | None = None
         if limit.isdigit() and int(limit) > 0:
-            headroom_mb = min(headroom_mb, int(limit) - wired * page // _MIB)
-        return max(0, headroom_mb)
+            wired_cap_mb = int(limit) - wired * page // _MIB
+            headroom_mb = min(headroom_mb, wired_cap_mb)
+        result_mb = max(0, headroom_mb)
+        log.debug(
+            "laplace.memory: free_pages=%s speculative_pages=%s "
+            "file_credit_pages=%s file_margin_pages=%s "
+            "file_cache_reclaim_margin=%s "
+            "compressor_growth_pages=%s wired_cap_mb=%s result_mb=%s",
+            free,
+            speculative,
+            file_credit,
+            file_margin,
+            self._file_cache_reclaim_margin,
+            growth,
+            wired_cap_mb,
+            result_mb,
+        )
+        return result_mb
