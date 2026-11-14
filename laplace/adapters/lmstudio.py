@@ -46,6 +46,8 @@ class _UncertainLoad:
 class LMStudioAdapter:
     """InferenceAdapter backed by the `lms` CLI."""
 
+    fallback_parallel = _FALLBACK_PARALLEL
+
     def __init__(
         self,
         lms_cli: str | None = None,
@@ -63,6 +65,9 @@ class LMStudioAdapter:
         self._load_grace_s = load_grace_s
         self._footprint_overrides = self._normalize_overrides(footprint_overrides)
         self._parallel_overrides = self._normalize_overrides(parallel_overrides)
+        # Best-effort observations keyed by runtime instance identity. The
+        # runtime does not report parallel, so list_loaded still prices each
+        # instance at least as high as its configured/default ceiling.
         self._loaded_parallel: dict[str, int] = {}
         self._footprint_cache: dict[str, int | None] = {}
         self._models_dir = self._expand_home(models_dir or _DEFAULT_MODELS_DIR)
@@ -105,24 +110,32 @@ class LMStudioAdapter:
             log.warning("lmstudio: invalid JSON from 'lms ps --json': %s", exc)
             return []
 
+        resident_ids = {
+            model_id
+            for entry in entries
+            if (model_id := self._entry_identifier(entry))
+        }
+        for model_id in set(self._loaded_parallel) - resident_ids:
+            self._loaded_parallel.pop(model_id, None)
+
         loaded: list[LoadedModel] = []
         for entry in entries:
             model_id = self._entry_identifier(entry)
             if not model_id:
                 continue
+            base = self.base_id(model_id)
+            recorded = self._loaded_parallel.get(model_id)
+            ceiling = self._parallel_overrides.get(base, self.fallback_parallel)
             loaded.append(
                 LoadedModel(
                     id=model_id,
-                    base_id=self.base_id(model_id),
+                    base_id=base,
                     size_bytes=self._entry_size_bytes(entry),
                     status=self._entry_status(entry),
                     last_used_ms=self._entry_last_used_ms(entry),
                     queued=self._entry_queued(entry),
                     context_length=self._entry_context_length(entry),
-                    parallel=self._loaded_parallel.get(
-                        self.base_id(model_id),
-                        self._parallel_overrides.get(self.base_id(model_id)),
-                    ),
+                    parallel=max(recorded or 0, ceiling),
                 )
             )
         return loaded
@@ -375,9 +388,9 @@ class LMStudioAdapter:
                         f"lmstudio load failed for {model_id} at ctx={context_length} "
                         f"(rc={rc}): {(err or out).strip()[:200]}"
                     )
-                await self._verify_load(model_id, context_length, before, keys)
+                loaded_id = await self._verify_load(model_id, context_length, before, keys)
                 if load_parallel is not None:
-                    self._loaded_parallel[base] = load_parallel
+                    self._loaded_parallel[loaded_id] = load_parallel
             except TimeoutError as exc:
                 pending = self._load_uncertain[base]
                 pending.reason = "timeout"
@@ -510,7 +523,7 @@ class LMStudioAdapter:
 
     async def _verify_load(
         self, model_id: str, context_length: int, before: list[dict], keys: set[str]
-    ) -> None:
+    ) -> str:
         previous = {self._entry_identifier(entry) for entry in before}
         deadline = time.monotonic() + min(10.0, self._load_timeout_s)
         while True:
@@ -518,7 +531,7 @@ class LMStudioAdapter:
             created = [entry for entry in entries if self._entry_identifier(entry) not in previous]
             exact = [entry for entry in created if self._entry_identifier(entry) == model_id]
             if exact and self._admit_resident(entries, model_id, context_length):
-                return
+                return self._entry_identifier(exact[0])
             # Known catalog identities may be another client's concurrent load.
             # Even an unknown identity is only a candidate, never proof of ownership.
             candidates = [
@@ -619,7 +632,9 @@ class LMStudioAdapter:
                 for entry in entries
             )
             if not still_loaded:
-                self._loaded_parallel.pop(base, None)
+                resident_ids = {self._entry_identifier(entry) for entry in entries}
+                for loaded_id in set(self._loaded_parallel) - resident_ids:
+                    self._loaded_parallel.pop(loaded_id, None)
                 return True
             if attempt == 0:
                 log.warning("lmstudio: %s still resident after unload; retrying once", model_id)

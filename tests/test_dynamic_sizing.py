@@ -9,6 +9,7 @@ from laplace.adapter import LoadCost
 from laplace.broker import ContentionBroker
 from laplace.priority import PriorityTier
 from laplace.reaper import Reaper
+from laplace_serve.admission import govern
 from tests.fakes import FakeAdapter, loaded_model
 
 
@@ -29,6 +30,7 @@ class DynamicAdapter(FakeAdapter):
     def __init__(self, *, configured_parallel: int = 2):
         super().__init__()
         self.configured_parallel = configured_parallel
+        self.fallback_parallel = configured_parallel
         self.cost_calls: list[int | None] = []
 
     async def load_cost(self, model_id, context_length, parallel=None):
@@ -108,6 +110,40 @@ async def test_nothing_fits_backpressures():
 
 
 @pytest.mark.asyncio
+async def test_shortfall_uses_parallel_one_when_nothing_fits(caplog):
+    adapter = DynamicAdapter()
+    target = broker(adapter, Headroom(200))
+    waiting = add_waiter(target)
+
+    with caplog.at_level(logging.INFO, logger="laplace.broker"):
+        assert await target.admit(MODEL, CTX, return_parallel=True) == (
+            "backpressure", None
+        )
+
+    waiting.cancel()
+    assert "shortfall_mb=10" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_unconfigured_model_uses_adapter_fallback_parallel_ceiling():
+    adapter = DynamicAdapter(configured_parallel=3)
+    target = ContentionBroker(
+        adapter,
+        Reaper(adapter),
+        headroom_mb=Headroom(1000),
+        dynamic_load_sizing=True,
+        parallel_ceilings={},
+        max_concurrent_lms=8,
+        timeout_s=0.01,
+    )
+    waiting = add_waiter(target)
+
+    assert await target.admit(MODEL, CTX, return_parallel=True) == ("admit", 2)
+    assert adapter.cost_calls == [2, 1]
+    waiting.cancel()
+
+
+@pytest.mark.asyncio
 async def test_pending_reserve_uses_chosen_parallel():
     adapter = DynamicAdapter()
     target = broker(adapter, Headroom(1000))
@@ -117,6 +153,45 @@ async def test_pending_reserve_uses_chosen_parallel():
 
     assert pending == 210
     assert adapter.cost_calls[-1] == 1
+
+
+@pytest.mark.asyncio
+async def test_govern_passes_this_admission_chosen_parallel_to_load():
+    small_ctx = 8192
+    class ContextScaledAdapter(DynamicAdapter):
+        async def load_cost(self, model_id, context_length, parallel=None):
+            selected = self.configured_parallel if parallel is None else parallel
+            self.cost_calls.append(parallel)
+            kv_mb = (context_length or small_ctx) // 1024 * selected
+            return LoadCost(100, kv_mb, 10, context_length, selected)
+
+    adapter = ContextScaledAdapter(configured_parallel=4)
+    adapter.loaded[MODEL] = loaded_model(
+        MODEL, status="idle", context_length=small_ctx, parallel=4
+    )
+    reaper = Reaper(adapter)
+    target = ContentionBroker(
+        adapter,
+        reaper,
+        headroom_mb=Headroom(300),
+        dynamic_load_sizing=True,
+        parallel_ceilings={MODEL: 4},
+        max_concurrent_lms=8,
+        timeout_s=0.01,
+    )
+
+    async with govern(
+        target, reaper, adapter, model=MODEL, ctx=small_ctx,
+        tier="scheduled", fail_open=False,
+    ) as first:
+        assert first.decision == "admit"
+        async with govern(
+            target, reaper, adapter, model=MODEL, ctx=CTX,
+            tier="scheduled", fail_open=False,
+        ) as second:
+            assert second.decision == "admit"
+
+    assert (MODEL, CTX, 1) in adapter.ensure_loaded_parallel_calls
 
 
 @pytest.mark.asyncio

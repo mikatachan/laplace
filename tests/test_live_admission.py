@@ -488,7 +488,10 @@ async def test_vm_stat_headroom_capped_by_wired_limit_and_fails_closed():
     async def broken(args):
         return None
 
-    assert await VmStatHeadroom(run=broken)() is None
+    probe = VmStatHeadroom(run=broken)
+    probe.shadow_headroom_mb = 123
+    assert await probe() is None
+    assert probe.shadow_headroom_mb is None
 
 
 @pytest.mark.asyncio
