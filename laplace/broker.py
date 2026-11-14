@@ -30,6 +30,8 @@ class ContentionBroker:
         timeout_s: float = DEFAULT_TIMEOUT_S,
         max_concurrent_lms: int = DEFAULT_MAX_CONCURRENT_LMS,
         headroom_mb: Optional[Callable[[], Awaitable[Optional[int]]]] = None,
+        dynamic_load_sizing: bool = False,
+        parallel_ceilings: dict[str, int] | None = None,
     ):
         """``headroom_mb`` enables live-memory admission: a cold load must fit
         in the live headroom it returns, after reserving KV growth for busy
@@ -41,23 +43,35 @@ class ContentionBroker:
         self._timeout = timeout_s
         self._max_concurrent = max(1, int(max_concurrent_lms))
         self._lock = asyncio.Lock()
-        self._waiters: list[tuple[int, int, asyncio.Future]] = []
+        self._waiters: list[tuple[int, int, str, asyncio.Future]] = []
         self._counter = 0
         self._reserved: dict[str, int] = {}
         self._budget_cache: int | None = None
         self._footprint_cache: dict[str, int | None] = {}
         self._headroom = headroom_mb
         self._reserved_ctx: dict[str, int | None] = {}
+        self._reserved_parallel: dict[str, int] = {}
+        self._dynamic_load_sizing = dynamic_load_sizing
+        self._parallel_ceilings = {
+            self._adapter.base_id(model): parallel
+            for model, parallel in (parallel_ceilings or {}).items()
+        }
         self._reaper.set_broker(self)
+
+    @property
+    def dynamic_load_sizing(self) -> bool:
+        return self._dynamic_load_sizing
 
     async def admit(
         self,
         model_id: str,
         context_length: int | None = None,
         priority: str = "scheduled",
-    ) -> str:
+        *,
+        return_parallel: bool = False,
+    ) -> str | tuple[str, int | None]:
         if not model_id:
-            return "admit"
+            return ("admit", None) if return_parallel else "admit"
         try:
             tier = from_legacy_string(priority)
         except ValueError:
@@ -81,8 +95,13 @@ class ContentionBroker:
                     context_length=context_length,
                 )
                 queued_for_unload = decision is None and self._reaper.is_unloading(model_id)
-                if decision == "admit":
+                if decision == "admit" or (
+                    isinstance(decision, tuple) and decision[0] == "admit"
+                ):
+                    chosen_parallel = decision[1] if isinstance(decision, tuple) else None
                     self._wake()
+                    if return_parallel:
+                        return "admit", chosen_parallel
                     return "admit"
                 if isinstance(decision, tuple) and decision[0] == "evict":
                     _, needed_mb, evict_prio = decision
@@ -104,14 +123,16 @@ class ContentionBroker:
             async with self._lock:
                 remaining = deadline - loop.time()
                 if remaining <= 0:
-                    return "backpressure"
+                    return ("backpressure", None) if return_parallel else "backpressure"
                 if queued_for_unload and not self._reaper.is_unloading(model_id):
                     # The unload ended before we parked, so its wake found no
                     # waiter. Re-evaluate now instead of waiting for another.
                     continue
                 fut = loop.create_future()
-                self._counter += 1
-                entry = (int(tier), self._counter, fut)
+                self._counter = max(
+                    (self._counter, *(queued[1] for queued in self._waiters))
+                ) + 1
+                entry = (int(tier), self._counter, model_id, fut)
                 heapq.heappush(self._waiters, entry)
                 if self._waiters and self._waiters[0] is not entry:
                     self._wake()
@@ -121,7 +142,7 @@ class ContentionBroker:
             except asyncio.TimeoutError:
                 async with self._lock:
                     self._remove_waiter(entry)
-                return "backpressure"
+                return ("backpressure", None) if return_parallel else "backpressure"
             except asyncio.CancelledError:
                 # The admit() task was cancelled while parked on the heap. Without
                 # this cleanup the entry lingers in self._waiters until a later
@@ -161,6 +182,7 @@ class ContentionBroker:
                         else:
                             self._reserved.pop(model_id, None)
                             self._reserved_ctx.pop(model_id, None)
+                            self._reserved_parallel.pop(model_id, None)
                         released = True
                     self._wake()
                 return
@@ -184,12 +206,12 @@ class ContentionBroker:
 
     def _wake(self) -> None:
         while self._waiters:
-            _, _, fut = heapq.heappop(self._waiters)
+            _, _, _, fut = heapq.heappop(self._waiters)
             if not fut.done():
                 fut.set_result(None)
                 return
 
-    def _remove_waiter(self, entry: tuple[int, int, asyncio.Future]) -> None:
+    def _remove_waiter(self, entry: tuple[int, int, str, asyncio.Future]) -> None:
         try:
             self._waiters.remove(entry)
         except ValueError:
@@ -259,8 +281,14 @@ class ContentionBroker:
         covered = self._covered_by_existing(model_id, context_length, entries)
         if covered == "admit":
             # No new load: an instance at this context is resident or pending.
-            self._reserve(model_id, context_length)
-            return "admit"
+            self._reserve(
+                model_id,
+                context_length,
+                self._known_parallel(model_id, entries)
+                if self._dynamic_load_sizing
+                else None,
+            )
+            return "admit", self._reserved_parallel.get(model_id)
         if covered == "wait":
             log.info(
                 "laplace.broker: load decision model=%s ctx=%s decision=queue "
@@ -270,38 +298,85 @@ class ContentionBroker:
             )
             return None
 
-        cost = await self._adapter.load_cost(model_id, context_length)
+        demand = self._same_model_demand(model_id)
+        ceiling = self._parallel_ceilings.get(self._adapter.base_id(model_id))
+        if self._dynamic_load_sizing and ceiling is None:
+            ceiling = getattr(self._adapter, "fallback_parallel", None)
+
+        cost = None
+        candidate_costs: list[LoadCost] = []
+        if self._dynamic_load_sizing:
+            if ceiling is None:
+                fallback = await self._adapter.load_cost(model_id, context_length)
+                ceiling = fallback.parallel if fallback is not None else None
+            if ceiling is None:
+                log.warning(
+                    "laplace.broker: load decision model=%s ctx=%s demand=%s "
+                    "chosen_parallel=none decision=queue reason=parallel-ceiling-unknown",
+                    model_id,
+                    context_length,
+                    demand,
+                )
+                return None
+            for parallel in range(min(ceiling or 1, demand), 0, -1):
+                candidate = await self._adapter.load_cost(
+                    model_id, context_length, parallel
+                )
+                if candidate is not None:
+                    candidate_costs.append(candidate)
+        else:
+            legacy_cost = await self._adapter.load_cost(model_id, context_length)
+            if legacy_cost is not None:
+                candidate_costs.append(legacy_cost)
+        if candidate_costs:
+            # P=1 is the cost and eviction baseline if no candidate fits.
+            cost = candidate_costs[-1] if self._dynamic_load_sizing else candidate_costs[0]
         if cost is None:
             log.warning(
-                "laplace.broker: load decision model=%s ctx=%s decision=queue "
+                "laplace.broker: load decision model=%s ctx=%s demand=%s "
+                "chosen_parallel=none decision=queue "
                 "reason=cost-unknown (no catalog size or footprint table entry)",
                 model_id,
                 context_length,
+                demand,
             )
             return None
         headroom = await self._headroom()
         if headroom is None:
             log.warning(
-                "laplace.broker: load decision model=%s cost_mb=%s decision=queue "
-                "reason=headroom-unreadable",
+                "laplace.broker: load decision model=%s cost_mb=%s demand=%s "
+                "chosen_parallel=none headroom_mb=unreadable "
+                "shadow_headroom_mb=%s decision=queue reason=headroom-unreadable",
                 model_id,
                 cost.total_mb,
+                demand,
+                self._shadow_headroom(),
             )
             return None
 
         inflight_mb, inflight_estimate = await self._inflight_reserve_mb(entries, context_length)
         pending_mb, pending_estimate = await self._pending_load_mb(resident)
         available = headroom - inflight_mb - pending_mb
+        if self._dynamic_load_sizing:
+            fitting = [candidate for candidate in candidate_costs if candidate.total_mb <= available]
+            if fitting:
+                cost = fitting[0]
+        chosen_parallel = (
+            cost.parallel if cost.total_mb <= available else None
+        )
         estimate = (*cost.estimate, *inflight_estimate, *pending_estimate)
 
         def note(decision: str, **extra) -> None:
             log.info(
-                "laplace.broker: load decision model=%s ctx=%s parallel=%s cost_mb=%s "
+                "laplace.broker: load decision model=%s ctx=%s parallel=%s demand=%s "
+                "chosen_parallel=%s cost_mb=%s "
                 "(weights=%s kv=%s overhead=%s) headroom_mb=%s inflight_reserve_mb=%s "
-                "pending_mb=%s available_mb=%s basis=%s decision=%s%s",
+                "pending_mb=%s available_mb=%s shadow_headroom_mb=%s basis=%s decision=%s%s",
                 model_id,
                 cost.context_length,
                 cost.parallel,
+                demand,
+                chosen_parallel if chosen_parallel is not None else "none",
                 cost.total_mb,
                 cost.weights_mb,
                 cost.kv_mb,
@@ -310,6 +385,7 @@ class ContentionBroker:
                 inflight_mb,
                 pending_mb,
                 available,
+                self._shadow_headroom(),
                 f"estimate({','.join(estimate)})" if estimate else "derived",
                 decision,
                 "".join(f" {key}={value}" for key, value in extra.items()),
@@ -317,8 +393,12 @@ class ContentionBroker:
 
         if cost.total_mb <= available:
             note("admit")
-            self._reserve(model_id, context_length)
-            return "admit"
+            self._reserve(
+                model_id,
+                context_length,
+                chosen_parallel if self._dynamic_load_sizing else None,
+            )
+            return "admit", chosen_parallel if self._dynamic_load_sizing else None
 
         shortfall = cost.total_mb - available
         evictable_ids = set(self._reaper.evictable_models(resident))
@@ -330,7 +410,11 @@ class ContentionBroker:
         # hold is not counted, so eviction is chosen only when it surely helps.
         credit = 0
         for entry in evictable:
-            victim = await self._adapter.load_cost(entry.id, entry.context_length)
+            victim = await self._load_cost(
+                entry.id,
+                entry.context_length,
+                entry.parallel if self._dynamic_load_sizing else None,
+            )
             if victim is not None:
                 credit += victim.weights_mb + victim.overhead_mb
         if credit < shortfall or not allow_evict:
@@ -373,7 +457,13 @@ class ContentionBroker:
             if ctx is None:
                 ctx = requested_ctx
                 estimate.append(f"inflight-ctx-unknown:{entry.id}")
-            cost = await self._adapter.load_cost(entry.id, ctx)
+            cost = await self._load_cost(
+                entry.id,
+                ctx,
+                (entry.parallel or self._parallel_for_model(entry.id))
+                if self._dynamic_load_sizing
+                else None,
+            )
             if cost is None:
                 estimate.append(f"inflight-cost-unknown:{entry.id}")
                 continue
@@ -388,8 +478,10 @@ class ContentionBroker:
         for model_id in self._reserved:
             if any(self._same_model(model_id, current) for current in resident):
                 continue
-            cost: LoadCost | None = await self._adapter.load_cost(
-                model_id, self._reserved_ctx.get(model_id)
+            cost: LoadCost | None = await self._load_cost(
+                model_id,
+                self._reserved_ctx.get(model_id),
+                self._reserved_parallel.get(model_id),
             )
             if cost is None:
                 estimate.append(f"pending-cost-unknown:{model_id}")
@@ -415,8 +507,7 @@ class ContentionBroker:
         ``admit``: one resident instance, or a pending load, at a context at
         least as large. ``wait``: a pending load at a smaller or unknown
         context, which this request must not ride on. ``None``: decide on cost.
-        Parallel is fixed per model by [model_parallel], so context is the only
-        per-request dimension.
+        Pending dynamic loads also retain their selected parallel dimension.
         """
         matches = [entry for entry in entries if self._same_model(model_id, entry.id)]
         if matches:
@@ -437,12 +528,56 @@ class ContentionBroker:
             return "admit"
         return "wait"
 
-    def _reserve(self, model_id: str, context_length: int | None = None) -> None:
+    def _reserve(
+        self,
+        model_id: str,
+        context_length: int | None = None,
+        parallel: int | None = None,
+    ) -> None:
         self._reserved[model_id] = self._reserved.get(model_id, 0) + 1
         if context_length is not None:
             self._reserved_ctx[model_id] = max(
                 context_length, self._reserved_ctx.get(model_id) or 0
             )
+        if parallel is not None:
+            self._reserved_parallel[model_id] = parallel
+
+    def _same_model_demand(self, model_id: str) -> int:
+        return 1 + sum(
+            1
+            for _, _, waiting_model, future in self._waiters
+            if not future.done() and self._same_model(model_id, waiting_model)
+        )
+
+    def _known_parallel(self, model_id: str, entries: list[LoadedModel]) -> int | None:
+        reserved = self._reserved_parallel.get(model_id)
+        if reserved is not None:
+            return reserved
+        return next(
+            (
+                entry.parallel
+                for entry in entries
+                if entry.parallel is not None and self._same_model(model_id, entry.id)
+            ),
+            None,
+        )
+
+    def _parallel_for_model(self, model_id: str) -> int | None:
+        return self._reserved_parallel.get(model_id)
+
+    async def _load_cost(
+        self,
+        model_id: str,
+        context_length: int | None,
+        parallel: int | None,
+    ) -> LoadCost | None:
+        if parallel is None:
+            return await self._adapter.load_cost(model_id, context_length)
+        return await self._adapter.load_cost(model_id, context_length, parallel)
+
+    def _shadow_headroom(self) -> int | str:
+        value = getattr(self._headroom, "shadow_headroom_mb", None)
+        return value if value is not None else "unavailable"
 
     def _active_calls(self) -> int:
         return sum(self._reserved.values())

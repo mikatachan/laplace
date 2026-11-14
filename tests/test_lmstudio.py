@@ -1,11 +1,53 @@
 from __future__ import annotations
 
+import json
 import logging
 
 import pytest
 
 from laplace.adapter import ModelLoadError
 from laplace.adapters.lmstudio import LMStudioAdapter
+
+
+@pytest.mark.asyncio
+async def test_external_reload_cannot_reuse_stale_smaller_parallel():
+    adapter = LMStudioAdapter(parallel_overrides={"some/model": 4})
+    resident = []
+
+    async def fake_run(args, timeout):
+        if args == ["ls", "--json"]:
+            return 0, '[{"modelKey": "some/model"}]', ""
+        if args[:2] == ["ps", "--json"]:
+            return 0, json.dumps(resident), ""
+        if args[0] == "load":
+            resident.append({"identifier": "some/model", "contextLength": int(args[3])})
+            return 0, "", ""
+        return 0, "", ""
+
+    adapter._run = fake_run
+    await adapter.ensure_loaded("some/model", 8192, 1)
+    resident.clear()
+    resident.append({"identifier": "some/model", "contextLength": 8192})
+
+    reported = {model.id: model.parallel for model in await adapter.list_loaded()}
+
+    assert reported["some/model"] == 4
+
+
+@pytest.mark.asyncio
+async def test_parallel_records_are_pruned_by_instance_identity():
+    adapter = LMStudioAdapter(parallel_overrides={"some/model": 4})
+    adapter._loaded_parallel["some/model:2"] = 1
+
+    async def fake_run(args, timeout):
+        assert args == ["ps", "--json"]
+        return 0, '[{"identifier": "some/model:3", "contextLength": 8192}]', ""
+
+    adapter._run = fake_run
+    loaded = await adapter.list_loaded()
+
+    assert adapter._loaded_parallel == {}
+    assert loaded[0].parallel == 4
 
 
 @pytest.mark.asyncio
@@ -118,6 +160,36 @@ async def test_parallel_load_args_are_opt_in(parallel_overrides, expected_load, 
     ]
     assert exec_messages == [f"lmstudio: exec lms {' '.join(expected_load)}"]
     assert ("--parallel 1" in exec_messages[0]) is (parallel_overrides is not None)
+
+
+@pytest.mark.asyncio
+async def test_explicit_parallel_reaches_load_without_mutating_override():
+    adapter = LMStudioAdapter(parallel_overrides={"some/model": 4})
+    loaded = False
+    load_args = None
+
+    async def fake_run(args, timeout):
+        nonlocal loaded, load_args
+        if args == ["ls", "--json"]:
+            return (0, '[{"modelKey": "some/model"}]', "")
+        if args[:2] == ["ps", "--json"]:
+            return (
+                0,
+                '[{"identifier": "some/model", "contextLength": 4096}]'
+                if loaded else "[]",
+                "",
+            )
+        load_args = args
+        loaded = True
+        return (0, "", "")
+
+    adapter._run = fake_run
+    await adapter.ensure_loaded("some/model", 4096, 2)
+
+    assert load_args == [
+        "load", "some/model", "--context-length", "4096", "--parallel", "2", "-y"
+    ]
+    assert adapter._parallel_overrides == {"some/model": 4}
 
 
 @pytest.mark.asyncio

@@ -42,6 +42,8 @@ def build_components(
         timeout_s=config.admit_timeout_s,
         max_concurrent_lms=config.max_concurrent,
         headroom_mb=VmStatHeadroom() if config.live_memory_admission else None,
+        dynamic_load_sizing=config.dynamic_load_sizing,
+        parallel_ceilings=dict(config.model_parallel),
     )
     return adapter, reaper, broker
 

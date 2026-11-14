@@ -241,6 +241,37 @@ wait, never load. Each decision logs one `load decision` line with every term;
 Requests for a model already resident at a sufficient context do not need a
 new load and are admitted as before.
 
+### Default-off dynamic parallel sizing
+
+Dynamic sizing is an opt-in extension of live-memory admission:
+
+```toml
+live_memory_admission = true
+dynamic_load_sizing = true
+
+[model_parallel]
+"qwen/qwen3-coder-30b" = 2
+```
+
+At each cold load, the configured `[model_parallel]` value is a ceiling rather
+than a forced allocation. laplaced counts the current request plus queued
+waiters for the same model, then chooses the largest parallel value no greater
+than that demand whose explicit load cost fits authoritative live headroom
+after busy-KV and pending-load reserves. Configured context is unchanged. If
+parallel 1 does not fit, the request follows the existing eviction and
+backpressure path. When a model has no `[model_parallel]` entry, dynamic sizing
+uses the adapter's existing fallback parallel (4 for LM Studio) as the ceiling,
+matching the default used by the non-dynamic live-admission path.
+
+Load-decision logs include demand, selected parallel, authoritative headroom,
+and a clearly labelled `shadow_headroom_mb`. The shadow value expands the
+file-backed reclaim estimate with protected, dirty/unavailable, and margin
+terms set to zero for observation only. It never authorizes a load.
+
+To roll back, set `dynamic_load_sizing = false` and restart laplaced. Existing
+resident models retain the dimensions at which they were loaded until they are
+unloaded normally.
+
 ## Prior art / where Laplace fits
 
 See the assessment in `docs/`. Closest adjacent tools: **llama-swap** (own-process idle TTL), **ConductorAPI** (multi-runtime budgets+priority, early-stage), **ollamaMQ** (Ollama request-priority proxy), **LocalAI** (LRU + idle watchdog). None do external-tenant-aware reaping.
