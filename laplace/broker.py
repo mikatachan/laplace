@@ -106,8 +106,9 @@ class ContentionBroker:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self._timeout
         evicted_this_cycle = False
-        # One measured (credit < shortfall) eviction per admission, ever, so a
-        # request cannot evict, fail to fit, and evict again on its next wake.
+        # After a measured (credit < shortfall) eviction this admission never
+        # evicts again, by either branch, so it cannot evict, fail to fit, and
+        # evict again on a later wake. Never set when measured_eviction is off.
         measured_eviction_used = False
 
         while True:
@@ -115,7 +116,7 @@ class ContentionBroker:
                 decision = await self._try_admit(
                     model_id,
                     tier,
-                    allow_evict=not evicted_this_cycle,
+                    allow_evict=not (evicted_this_cycle or measured_eviction_used),
                     context_length=context_length,
                     need_context=need_context,
                     allow_measured_eviction=(
@@ -319,6 +320,17 @@ class ContentionBroker:
         covered = self._covered_by_existing(model_id, required_ctx, entries)
         if covered == "admit":
             # No new load: an instance at this context is resident or pending.
+            if need_context and not any(
+                self._same_model(model_id, entry.id) for entry in entries
+            ):
+                # Riding on a pending load: whichever admitted request reaches
+                # the loader first must load at the pending load's context, or
+                # the larger request finds a too-small instance.
+                required_ctx = max(
+                    self._reserved_ctx.get(reserved) or 0
+                    for reserved in self._reserved
+                    if self._same_model(model_id, reserved)
+                )
             self._reserve(model_id, required_ctx)
             if not need_context:
                 return "admit"

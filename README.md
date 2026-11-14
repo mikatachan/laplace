@@ -257,8 +257,10 @@ measured_eviction = true
 ```
 
 - **`fit_context_admission`**: each request gets a context need: the request
-  body's UTF-8 bytes / 3 (rounded up; an over-estimate of prompt tokens for
-  typical text, since the body also carries JSON, roles and tool schemas), plus
+  body's UTF-8 byte count plus 1024 for chat-template tokens (an upper bound
+  without a tokenizer: byte-level tokenizers emit at most one token per byte,
+  and the body also carries JSON syntax; about 4x the real count for English),
+  plus
   `max_tokens` / `max_completion_tokens` / `max_output_tokens` when sent, else
   `fit_context_min_output_tokens`. A need above the `[model_context]` value is
   treated as that value. When the cost at the configured context does not fit,
@@ -267,7 +269,9 @@ measured_eviction = true
   least the need. If even the need does not fit, the request queues as before.
   Requests are never truncated. The chosen context is reserved, priced and
   passed to `lms load --context-length`. A resident instance serves a request
-  only if its context covers that request's need. If the resident context is
+  only if its context covers that request's need. A request that rides on a
+  pending load gets that load's context, so whichever request reaches the
+  loader first loads at it. If the resident context is
   smaller, the request waits until the reaper's idle unload removes that
   instance, because laplaced does not load a second instance next to it.
   The log line shows `need_ctx`, `configured_ctx` and `fit_ctx`. Output
@@ -280,7 +284,8 @@ measured_eviction = true
   reservations; busy and external models are never evicted). Then laplaced
   measures headroom again and runs the full fit check. This happens at most
   once per request: a request that still does not fit waits, and it never
-  evicts again on a later wake (`decision=evict-measured` in the log).
+  evicts again on a later wake, by either the measured or the credit-based
+  path (`decision=evict-measured` in the log).
 
 Rollback: set either flag to `false` (or delete the line) and restart laplaced.
 

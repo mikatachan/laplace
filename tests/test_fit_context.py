@@ -259,8 +259,30 @@ async def test_pending_fitted_load_is_reserved_at_the_fitted_context(tmp_path):
     _, ctx = await broker.admit_sized(GLM, GLM_CTX, need_context=20000)
     # A need above the pending load's context must wait for it.
     assert await broker.admit_sized(GLM, GLM_CTX, need_context=ctx + 1) == ("backpressure", None)
-    # A need within it rides on the pending load.
-    assert await broker.admit_sized(GLM, GLM_CTX, need_context=ctx - 1) == ("admit", ctx - 1)
+    # A need within it rides on the pending load, at the pending load's context.
+    assert await broker.admit_sized(GLM, GLM_CTX, need_context=ctx - 1) == ("admit", ctx)
+
+
+@pytest.mark.asyncio
+async def test_follower_of_pending_load_loads_at_the_pending_context(tmp_path):
+    # PR 28 review: a smaller follower that wins the adapter lock must load at
+    # the pending fitted context, or the larger admitted request is refused as
+    # a duplicate load against the smaller instance.
+    adapter = ArchAdapter(tmp_path)
+    reaper = Reaper(adapter)
+    broker = ContentionBroker(
+        adapter, reaper, headroom_mb=Probe(70000), timeout_s=0.1,
+        fit_context=True, max_concurrent_lms=4,
+    )
+    decision, larger_ctx = await broker.admit_sized(GLM, GLM_CTX, need_context=20000)
+    assert decision == "admit"
+    async with govern(
+        broker, reaper, adapter, model=GLM, ctx=GLM_CTX, tier="interactive",
+        fail_open=False, need_ctx=10000,
+    ) as admission:
+        assert admission.decision == "admit"
+    assert adapter.ensure_loaded_calls == [(GLM, larger_ctx)]
+    assert broker._reserved_ctx[GLM] == larger_ctx
 
 
 # --- Change 2: measured eviction ----------------------------------------------
@@ -340,6 +362,46 @@ async def test_measured_eviction_runs_once_per_admission_no_loop(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_no_eviction_of_any_kind_after_a_measured_eviction(tmp_path):
+    # PR 28 review repro: the measured eviction frees nothing and the request
+    # parks. After the wake, headroom is 50,000 MiB, so the same credit now
+    # covers the smaller shortfall; the ordinary branch must not evict again.
+    adapter = ArchAdapter(tmp_path, loaded=[_idle_qwen()])
+    reaper = _managed_reaper(adapter, QWEN)
+    probe = Probe(H_1119, H_1119, H_1119, H_1119, 50_000)
+    broker = ContentionBroker(
+        adapter, reaper, headroom_mb=probe, timeout_s=0.5,
+        fit_context=True, measured_eviction=True,
+    )
+    request = asyncio.create_task(broker.admit_sized(GLM, GLM_CTX, need_context=20000))
+    while not adapter.force_unload_calls or not broker._waiters:
+        await asyncio.sleep(0.01)
+    adapter.loaded[QWEN] = _idle_qwen()
+    await broker.notify_freed()
+    assert await request == ("backpressure", None)
+    assert adapter.force_unload_calls == [QWEN]
+
+
+@pytest.mark.asyncio
+async def test_without_measured_eviction_ordinary_eviction_repeats_across_wakes(tmp_path):
+    # Flag off keeps main's behaviour: each wake may evict again when the
+    # credit covers the shortfall.
+    adapter = ArchAdapter(tmp_path, loaded=[_idle_qwen()])
+    reaper = _managed_reaper(adapter, QWEN)
+    probe = Probe(50_000)
+    broker = ContentionBroker(
+        adapter, reaper, headroom_mb=probe, timeout_s=0.5, fit_context=True
+    )
+    request = asyncio.create_task(broker.admit_sized(GLM, GLM_CTX, need_context=20000))
+    while not adapter.force_unload_calls or not broker._waiters:
+        await asyncio.sleep(0.01)
+    adapter.loaded[QWEN] = _idle_qwen()
+    await broker.notify_freed()
+    assert await request == ("backpressure", None)
+    assert adapter.force_unload_calls == [QWEN, QWEN]
+
+
+@pytest.mark.asyncio
 async def test_measured_eviction_alone_without_fit_context(tmp_path):
     # Change 2 without Change 1: measured eviction toward the configured context.
     adapter = ArchAdapter(tmp_path, loaded=[_idle_qwen()])
@@ -357,20 +419,39 @@ async def test_measured_eviction_alone_without_fit_context(tmp_path):
 
 
 def test_estimate_need_tokens():
+    from laplace_serve.app import _TEMPLATE_ALLOWANCE_TOKENS as allowance
+
     body = json.dumps({"model": GLM, "messages": [{"role": "user", "content": "x" * 3000}]})
-    prompt = -(-len(body.encode()) // 3)
+    prompt = len(body.encode()) + allowance
     assert _estimate_need_tokens(body.encode(), 8192) == prompt + 8192
     for key in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
         sized = json.dumps({"model": GLM, key: 500}).encode()
-        assert _estimate_need_tokens(sized, 8192) == -(-len(sized) // 3) + 500
+        assert _estimate_need_tokens(sized, 8192) == len(sized) + allowance + 500
     # Multi-byte text counts by UTF-8 bytes, not characters.
     wide = json.dumps({"input": "中" * 300}, ensure_ascii=False).encode()
-    assert _estimate_need_tokens(wide, 1) >= 300
-    assert _estimate_need_tokens(b"not json", 100) == 3 + 100
+    assert _estimate_need_tokens(wide, 1) >= 900
+    assert _estimate_need_tokens(b"not json", 100) == 8 + allowance + 100
     # Booleans and non-positive limits are not output limits.
     for bad in (True, 0, -5, "10"):
         sized = json.dumps({"max_tokens": bad}).encode()
-        assert _estimate_need_tokens(sized, 77) == -(-len(sized) // 3) + 77
+        assert _estimate_need_tokens(sized, 77) == len(sized) + allowance + 77
+
+
+def test_estimate_need_covers_token_dense_prompt():
+    # PR 28 review repro: 12,000 random alphanumerics. The GLM-4.5-Air
+    # tokenizer with its chat template counts 8,680 prompt tokens (measured
+    # offline with transformers by the reviewer); bytes / 3 gave 4,025.
+    import random
+    import string
+
+    rng = random.Random(28)
+    content = "".join(rng.choice(string.ascii_letters + string.digits) for _ in range(12_000))
+    body = json.dumps(
+        {"model": "glm", "messages": [{"role": "user", "content": content}], "max_tokens": 1},
+        separators=(",", ":"),
+    ).encode()
+    assert len(body) == 12072
+    assert _estimate_need_tokens(body, 8192) >= 8680 + 1
 
 
 def test_fit_context_flags_are_opt_in_and_validated():

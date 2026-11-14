@@ -473,15 +473,31 @@ def _extract_model_stream(body: bytes) -> tuple[str | None, bool]:
 _OUTPUT_LIMIT_KEYS = ("max_tokens", "max_completion_tokens", "max_output_tokens")
 
 
-def _estimate_need_tokens(body: bytes, min_output_tokens: int) -> int:
-    """Conservative context a request needs: prompt plus output allowance.
+# Chat-template tokens that have no bytes in the request body: default system
+# prompts and tool-calling instructions. Worst seen: Qwen3-Coder rendered a
+# 222-byte request with one tool to 257 tokens (see _estimate_need_tokens).
+_TEMPLATE_ALLOWANCE_TOKENS = 1024
 
-    Prompt: the whole request body in UTF-8 bytes / 3, rounded up. The body
-    includes JSON syntax, roles and tool schemas, and a byte count is at least
-    the character count, so this exceeds a tokenizer's count for typical text.
+
+def _estimate_need_tokens(body: bytes, min_output_tokens: int) -> int:
+    """Upper-bound context a request needs: prompt plus output allowance.
+
+    Prompt: the request body's UTF-8 byte count plus
+    ``_TEMPLATE_ALLOWANCE_TOKENS``. Without a tokenizer (the core is
+    stdlib-only) bytes are the bound: byte-level BPE and byte-fallback
+    SentencePiece emit at most one token per byte of text, so 12,000 random
+    digits cost about 12,000 tokens on Qwen and Gemma. JSON escaping makes the
+    body longer than the strings the template renders, and each message's JSON
+    syntax (about 25 bytes) outweighs its template tokens. Offline, five local
+    tokenizers (GLM-4.5-Air, gpt-oss, Qwen3-Coder, Qwen3-Next, Gemma 4) on 15
+    adversarial bodies (digits, punctuation, CJK, emoji, 400 empty messages,
+    300 tools, 200-parameter schemas) never rendered more than 35 tokens above
+    body bytes. An empirical bound, not a proof for every template. For
+    English it is about 4.3x the real count; a need above the configured
+    context is treated as the configured context.
     Output: the caller's limit when it sends one, else ``min_output_tokens``.
     """
-    prompt = -(-len(body) // 3)
+    prompt = len(body) + _TEMPLATE_ALLOWANCE_TOKENS
     output = min_output_tokens
     try:
         payload = json.loads(body) if body else None
