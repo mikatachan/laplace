@@ -449,12 +449,14 @@ def test_parse_vm_stat():
 
 
 @pytest.mark.asyncio
-async def test_vm_stat_headroom_counts_file_backed_inactive_and_compressor_growth():
-    # active 100 + inactive 512 + speculative 64 = 676 pageable; file-backed 600
-    # => at least 512 + 600 - 676 = 436 inactive pages are file-backed.
-    state = dict(active=100, inactive=512, speculative=64, file=600)
+async def test_vm_stat_headroom_counts_file_cache_and_compressor_growth():
+    # File pool = min(10000 + 5120, 15120 - 64) = 15056; default margin credits 14303 pages.
+    state = dict(active=10000, inactive=5120, speculative=64, file=15120)
     outputs = {
-        "vm_stat": [_vm(compressor=100, **state), _vm(compressor=100 + 640, **state)],
+        "vm_stat": [
+            _vm(free=10240, compressor=100, **state),
+            _vm(free=10240, compressor=100 + 640, **state),
+        ],
         "sysctl": ["0\n", "0\n"],
     }
 
@@ -462,15 +464,42 @@ async def test_vm_stat_headroom_counts_file_backed_inactive_and_compressor_growt
         return outputs[args[0]].pop(0)
 
     probe = VmStatHeadroom(run=run)
-    assert await probe() == (1024 + 64 + 436) * 16384 // _MIB == 23
+    assert await probe() == (10240 + 64 + 14303) * 16384 // _MIB == 384
     # 640 pages of compressor growth (10 MB) is subtracted as pressure.
-    assert await probe() == 13
+    assert await probe() == 374
 
 
 @pytest.mark.asyncio
-async def test_vm_stat_headroom_counts_no_inactive_when_overlap_unproven():
-    # Reviewer counterexample: 1000 active file-backed + 1000 inactive anonymous.
-    text = _vm(free=0, active=1000, inactive=1000, speculative=0, file=1000)
+async def test_vm_stat_headroom_measured_sample_and_margin():
+    text = _vm(
+        free=1526869, active=1687597, inactive=2408129,
+        speculative=261194, file=2565333, wired=354190,
+    )
+
+    async def run(args):
+        return text if args[0] == "vm_stat" else "0\n"
+
+    assert await VmStatHeadroom(run=run)() == 62140
+
+
+@pytest.mark.asyncio
+async def test_vm_stat_headroom_does_not_double_count_speculative_and_margin_is_exact():
+    # 6464 file-backed pages include 64 speculative; the candidate is 6400 (100 MB).
+    text = _vm(free=0, active=6400, inactive=64, speculative=64, file=6464)
+
+    async def run(args):
+        return text if args[0] == "vm_stat" else "0\n"
+
+    full = await VmStatHeadroom(run=run, file_cache_reclaim_margin=0)()
+    margin = await VmStatHeadroom(run=run, file_cache_reclaim_margin=0.10)()
+    file_credit_mb = 6400 * 16384 // _MIB
+    assert full == (64 + 6400) * 16384 // _MIB == 101
+    assert full - margin == file_credit_mb * 0.10 == 10
+
+
+@pytest.mark.asyncio
+async def test_vm_stat_headroom_file_cache_is_capped_by_active_and_inactive():
+    text = _vm(free=0, active=64, inactive=0, speculative=0, file=1024)
 
     async def run(args):
         return text if args[0] == "vm_stat" else "0\n"
@@ -496,5 +525,20 @@ def test_live_memory_admission_is_opt_in():
     assert default._headroom is None
     _, _, live = build_components(LaplacedConfig.from_dict({"live_memory_admission": True}))
     assert isinstance(live._headroom, VmStatHeadroom)
+    assert live._headroom._file_cache_reclaim_margin == 0.05
+    _, _, custom = build_components(
+        LaplacedConfig.from_dict(
+            {"live_memory_admission": True, "file_cache_reclaim_margin": 0.2}
+        )
+    )
+    assert custom._headroom._file_cache_reclaim_margin == 0.2
     with pytest.raises(ValueError):
         LaplacedConfig.from_dict({"live_memory_admission": "yes"})
+    assert LaplacedConfig().file_cache_reclaim_margin == 0.05
+    assert LaplacedConfig.from_dict({"file_cache_reclaim_margin": 0.0}).file_cache_reclaim_margin == 0.0
+    for margin in (True, False):
+        with pytest.raises(ValueError, match="file_cache_reclaim_margin"):
+            LaplacedConfig.from_dict({"file_cache_reclaim_margin": margin})
+    for margin in (-0.01, 1.01):
+        with pytest.raises(ValueError, match="file_cache_reclaim_margin"):
+            LaplacedConfig.from_dict({"file_cache_reclaim_margin": margin})
