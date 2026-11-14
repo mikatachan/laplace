@@ -41,7 +41,11 @@ def build_components(
         budget_mb=config.budget_mb_or_none(),
         timeout_s=config.admit_timeout_s,
         max_concurrent_lms=config.max_concurrent,
-        headroom_mb=VmStatHeadroom() if config.live_memory_admission else None,
+        headroom_mb=(
+            VmStatHeadroom(file_cache_reclaim_margin=config.file_cache_reclaim_margin)
+            if config.live_memory_admission
+            else None
+        ),
     )
     return adapter, reaper, broker
 
