@@ -95,10 +95,13 @@ class ContentionBroker:
                     context_length=context_length,
                 )
                 queued_for_unload = decision is None and self._reaper.is_unloading(model_id)
-                if decision == "admit":
+                if decision == "admit" or (
+                    isinstance(decision, tuple) and decision[0] == "admit"
+                ):
+                    chosen_parallel = decision[1] if isinstance(decision, tuple) else None
                     self._wake()
                     if return_parallel:
-                        return "admit", self._parallel_for_model(model_id)
+                        return "admit", chosen_parallel
                     return "admit"
                 if isinstance(decision, tuple) and decision[0] == "evict":
                     _, needed_mb, evict_prio = decision
@@ -126,7 +129,9 @@ class ContentionBroker:
                     # waiter. Re-evaluate now instead of waiting for another.
                     continue
                 fut = loop.create_future()
-                self._counter += 1
+                self._counter = max(
+                    (self._counter, *(queued[1] for queued in self._waiters))
+                ) + 1
                 entry = (int(tier), self._counter, model_id, fut)
                 heapq.heappush(self._waiters, entry)
                 if self._waiters and self._waiters[0] is not entry:
@@ -283,7 +288,7 @@ class ContentionBroker:
                 if self._dynamic_load_sizing
                 else None,
             )
-            return "admit"
+            return "admit", self._reserved_parallel.get(model_id)
         if covered == "wait":
             log.info(
                 "laplace.broker: load decision model=%s ctx=%s decision=queue "
@@ -296,18 +301,23 @@ class ContentionBroker:
         demand = self._same_model_demand(model_id)
         ceiling = self._parallel_ceilings.get(self._adapter.base_id(model_id))
         if self._dynamic_load_sizing and ceiling is None:
-            log.warning(
-                "laplace.broker: load decision model=%s ctx=%s demand=%s "
-                "chosen_parallel=none decision=queue reason=parallel-ceiling-unconfigured",
-                model_id,
-                context_length,
-                demand,
-            )
-            return None
+            ceiling = getattr(self._adapter, "fallback_parallel", None)
 
         cost = None
         candidate_costs: list[LoadCost] = []
         if self._dynamic_load_sizing:
+            if ceiling is None:
+                fallback = await self._adapter.load_cost(model_id, context_length)
+                ceiling = fallback.parallel if fallback is not None else None
+            if ceiling is None:
+                log.warning(
+                    "laplace.broker: load decision model=%s ctx=%s demand=%s "
+                    "chosen_parallel=none decision=queue reason=parallel-ceiling-unknown",
+                    model_id,
+                    context_length,
+                    demand,
+                )
+                return None
             for parallel in range(min(ceiling or 1, demand), 0, -1):
                 candidate = await self._adapter.load_cost(
                     model_id, context_length, parallel
@@ -319,7 +329,8 @@ class ContentionBroker:
             if legacy_cost is not None:
                 candidate_costs.append(legacy_cost)
         if candidate_costs:
-            cost = candidate_costs[0]
+            # P=1 is the cost and eviction baseline if no candidate fits.
+            cost = candidate_costs[-1] if self._dynamic_load_sizing else candidate_costs[0]
         if cost is None:
             log.warning(
                 "laplace.broker: load decision model=%s ctx=%s demand=%s "
@@ -387,7 +398,7 @@ class ContentionBroker:
                 context_length,
                 chosen_parallel if self._dynamic_load_sizing else None,
             )
-            return "admit"
+            return "admit", chosen_parallel if self._dynamic_load_sizing else None
 
         shortfall = cost.total_mb - available
         evictable_ids = set(self._reaper.evictable_models(resident))
@@ -529,7 +540,7 @@ class ContentionBroker:
                 context_length, self._reserved_ctx.get(model_id) or 0
             )
         if parallel is not None:
-            self._reserved_parallel.setdefault(model_id, parallel)
+            self._reserved_parallel[model_id] = parallel
 
     def _same_model_demand(self, model_id: str) -> int:
         return 1 + sum(
@@ -539,7 +550,7 @@ class ContentionBroker:
         )
 
     def _known_parallel(self, model_id: str, entries: list[LoadedModel]) -> int | None:
-        reserved = self._parallel_for_model(model_id)
+        reserved = self._reserved_parallel.get(model_id)
         if reserved is not None:
             return reserved
         return next(
@@ -552,14 +563,7 @@ class ContentionBroker:
         )
 
     def _parallel_for_model(self, model_id: str) -> int | None:
-        return next(
-            (
-                parallel
-                for reserved, parallel in self._reserved_parallel.items()
-                if self._same_model(model_id, reserved)
-            ),
-            None,
-        )
+        return self._reserved_parallel.get(model_id)
 
     async def _load_cost(
         self,

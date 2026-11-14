@@ -79,6 +79,7 @@ class VmStatHeadroom:
         self.shadow_headroom_mb: int | None = None
 
     async def __call__(self) -> int | None:
+        self.shadow_headroom_mb = None
         text = await self._run(["vm_stat"])
         if text is None:
             return None

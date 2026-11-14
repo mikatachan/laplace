@@ -259,7 +259,9 @@ waiters for the same model, then chooses the largest parallel value no greater
 than that demand whose explicit load cost fits authoritative live headroom
 after busy-KV and pending-load reserves. Configured context is unchanged. If
 parallel 1 does not fit, the request follows the existing eviction and
-backpressure path.
+backpressure path. When a model has no `[model_parallel]` entry, dynamic sizing
+uses the adapter's existing fallback parallel (4 for LM Studio) as the ceiling,
+matching the default used by the non-dynamic live-admission path.
 
 Load-decision logs include demand, selected parallel, authoritative headroom,
 and a clearly labelled `shadow_headroom_mb`. The shadow value expands the
