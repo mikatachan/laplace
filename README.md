@@ -103,8 +103,21 @@ auth_command = ["credential-helper", "read", "shinobi"]
 "bot:google/gemma-4-e4b" = ["shinobi", "axis"]
 ```
 
-Remote state and fixed reason codes are available at `GET /fleet/status`.
-Omitting `[placement]` performs no credential command, probe, or remote request.
+Remote host state and per-model state are available at `GET /fleet/status`.
+Model-level failures (`auth`, `upstream-5xx`, `first-byte`, and
+`upstream-inband-error`) mark only that backend/model pair DOWN; connection
+failures and `probe-connect` mark the whole backend host DOWN. Two successful
+probes, 120 seconds apart, recover host and model states. `probe-timeout` is
+reported separately from `probe-connect`. HTTP 400/404/429 and 5xx fallbacks
+include a sanitized, length-limited upstream error message in the route log;
+the in-band reason does the same. Omitting `[placement]` performs no credential
+command, probe, or remote request.
+
+For a 2xx non-stream response, laplaced inspects the response body before
+committing it. For a stream, it buffers at most the first SSE event or JSON
+value (bounded to 64 KiB). An initial `{"error": ...}` produces
+`fallback:upstream-inband-error` and tries the next placement instead of
+relaying the error as a served response.
 
 ### Opt-in governed REST authentication
 

@@ -239,7 +239,7 @@ async def _route(
                 request, origin, tier, model, stream, ctx, forwarded_body
             )
         result = await request.app[FLEET].backends[backend_name].forward(
-            request, _upstream_path(request), forwarded_body
+            request, _upstream_path(request), forwarded_body, model, stream
         )
         if result.response is not None:
             log.info(
@@ -249,13 +249,23 @@ async def _route(
                 backend_name,
             )
             return result.response
-        log.info(
-            "route origin=%s model=%s backend=%s reason=fallback:%s",
-            origin,
-            model or "-",
-            backend_name,
-            result.failure_reason,
-        )
+        if result.failure_message is None:
+            log.info(
+                "route origin=%s model=%s backend=%s reason=fallback:%s",
+                origin,
+                model or "-",
+                backend_name,
+                result.failure_reason,
+            )
+        else:
+            log.info(
+                "route origin=%s model=%s backend=%s reason=fallback:%s message=%s",
+                origin,
+                model or "-",
+                backend_name,
+                result.failure_reason,
+                result.failure_message,
+            )
     return web.json_response({"error": "no backend available"}, status=502)
 
 
