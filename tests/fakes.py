@@ -15,6 +15,7 @@ class FakeAdapter:
         self.loaded: dict[str, LoadedModel] = {entry.id: entry for entry in (loaded or [])}
         self.footprints = dict(footprints or {})
         self.ensure_loaded_calls: list[tuple[str, int | None]] = []
+        self.ensure_loaded_parallel_calls: list[tuple[str, int | None, int | None]] = []
         self.force_unload_calls: list[str] = []
         self.unload_outcomes: dict[str, list[bool]] = {}
 
@@ -37,8 +38,14 @@ class FakeAdapter:
             return int(entry.size_bytes * 1.3 / (1024 * 1024))
         return None
 
-    async def ensure_loaded(self, model_id: str, context_length: int | None) -> None:
+    async def ensure_loaded(
+        self,
+        model_id: str,
+        context_length: int | None,
+        parallel: int | None = None,
+    ) -> None:
         self.ensure_loaded_calls.append((model_id, context_length))
+        self.ensure_loaded_parallel_calls.append((model_id, context_length, parallel))
         current = self.loaded.get(model_id)
         size_bytes = current.size_bytes if current else None
         status = current.status if current else "idle"
@@ -52,6 +59,7 @@ class FakeAdapter:
             last_used_ms=last_used_ms,
             queued=queued,
             context_length=context_length,
+            parallel=parallel,
         )
 
     def guard_window_remaining_s(self) -> float | None:
@@ -81,6 +89,7 @@ def loaded_model(
     last_used_ms: float | None = None,
     queued: int | None = None,
     context_length: int | None = None,
+    parallel: int | None = None,
 ) -> LoadedModel:
     adapter = FakeAdapter()
     return LoadedModel(
@@ -91,6 +100,7 @@ def loaded_model(
         last_used_ms=last_used_ms,
         queued=queued,
         context_length=context_length,
+        parallel=parallel,
     )
 
 

@@ -63,6 +63,7 @@ class LMStudioAdapter:
         self._load_grace_s = load_grace_s
         self._footprint_overrides = self._normalize_overrides(footprint_overrides)
         self._parallel_overrides = self._normalize_overrides(parallel_overrides)
+        self._loaded_parallel: dict[str, int] = {}
         self._footprint_cache: dict[str, int | None] = {}
         self._models_dir = self._expand_home(models_dir or _DEFAULT_MODELS_DIR)
         self._catalog_entries: dict[str, dict] = {}
@@ -118,6 +119,10 @@ class LMStudioAdapter:
                     last_used_ms=self._entry_last_used_ms(entry),
                     queued=self._entry_queued(entry),
                     context_length=self._entry_context_length(entry),
+                    parallel=self._loaded_parallel.get(
+                        self.base_id(model_id),
+                        self._parallel_overrides.get(self.base_id(model_id)),
+                    ),
                 )
             )
         return loaded
@@ -179,7 +184,12 @@ class LMStudioAdapter:
         self._footprint_cache[model_id] = estimate
         return estimate
 
-    async def load_cost(self, model_id: str, context_length: int | None) -> LoadCost | None:
+    async def load_cost(
+        self,
+        model_id: str,
+        context_length: int | None,
+        parallel: int | None = None,
+    ) -> LoadCost | None:
         """Peak memory for ``model_id`` loaded at ``context_length`` x parallel.
 
         weights: catalog ``sizeBytes``, else the configured footprint table.
@@ -199,7 +209,7 @@ class LMStudioAdapter:
                 return None
             weights_mb = override
             estimate.append("weights=footprint-table")
-        parallel = self._parallel_overrides.get(base)
+        parallel = parallel if parallel is not None else self._parallel_overrides.get(base)
         if parallel is None:
             parallel = _FALLBACK_PARALLEL
             estimate.append(f"parallel=unconfigured({parallel})")
@@ -301,7 +311,12 @@ class LMStudioAdapter:
         self._kv_specs_cache[base] = specs
         return specs
 
-    async def ensure_loaded(self, model_id: str, context_length: int | None) -> None:
+    async def ensure_loaded(
+        self,
+        model_id: str,
+        context_length: int | None,
+        parallel: int | None = None,
+    ) -> None:
         if not model_id or not context_length or context_length <= 0:
             return
         base = self.base_id(model_id)
@@ -342,9 +357,11 @@ class LMStudioAdapter:
             self._active_load = base
             try:
                 load_args = ["load", model_id, "--context-length", str(context_length)]
-                parallel = self._parallel_overrides.get(base)
-                if parallel is not None:
-                    load_args.extend(["--parallel", str(parallel)])
+                load_parallel = (
+                    parallel if parallel is not None else self._parallel_overrides.get(base)
+                )
+                if load_parallel is not None:
+                    load_args.extend(["--parallel", str(load_parallel)])
                 load_args.append("-y")
                 log.info("lmstudio: exec lms %s", " ".join(load_args))
                 rc, out, err = await self._run(load_args, timeout=self._load_timeout_s)
@@ -359,6 +376,8 @@ class LMStudioAdapter:
                         f"(rc={rc}): {(err or out).strip()[:200]}"
                     )
                 await self._verify_load(model_id, context_length, before, keys)
+                if load_parallel is not None:
+                    self._loaded_parallel[base] = load_parallel
             except TimeoutError as exc:
                 pending = self._load_uncertain[base]
                 pending.reason = "timeout"
@@ -600,6 +619,7 @@ class LMStudioAdapter:
                 for entry in entries
             )
             if not still_loaded:
+                self._loaded_parallel.pop(base, None)
                 return True
             if attempt == 0:
                 log.warning("lmstudio: %s still resident after unload; retrying once", model_id)

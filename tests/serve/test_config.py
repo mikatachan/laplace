@@ -14,6 +14,7 @@ def test_defaults_match_plan():
     assert config.upstream == "http://127.0.0.1:1234"
     assert config.max_concurrent == 2
     assert config.default_context_length == 64000
+    assert config.dynamic_load_sizing is False
     assert config.tier_for("hermes") == "interactive"
     assert config.tier_for("bot") == "interactive"
     assert config.tier_for("default") == "scheduled"
@@ -128,6 +129,18 @@ def test_bad_footprint_type_rejected():
 def test_bad_parallel_rejected():
     with pytest.raises(ValueError, match="must be positive"):
         LaplacedConfig.from_dict({"model_parallel": {"m": 0}})
+
+
+def test_dynamic_load_sizing_requires_live_memory_and_boolean():
+    with pytest.raises(ValueError, match="must be a boolean"):
+        LaplacedConfig.from_dict({"dynamic_load_sizing": "yes"})
+    with pytest.raises(ValueError, match="requires live_memory_admission"):
+        LaplacedConfig.from_dict({"dynamic_load_sizing": True})
+
+    config = LaplacedConfig.from_dict(
+        {"dynamic_load_sizing": True, "live_memory_admission": True}
+    )
+    assert config.dynamic_load_sizing is True
 
 
 def test_missing_context_ids_lists_gaps():

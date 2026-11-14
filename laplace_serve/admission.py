@@ -65,9 +65,16 @@ async def govern(
         return
 
     try:
-        decision = await broker.admit(model, ctx, tier)
+        broker_result = await broker.admit(
+            model, ctx, tier, return_parallel=True
+        )
+        if isinstance(broker_result, tuple):
+            decision, parallel = broker_result
+        else:
+            # Compatibility with small test and third-party broker doubles.
+            decision, parallel = broker_result, None
     except Exception as exc:  # noqa: BLE001 - broker failure is daemon-internal
-        if not fail_open:
+        if not fail_open or getattr(broker, "dynamic_load_sizing", False):
             raise
         log.warning("admission: broker error, forwarding ungoverned: %s", exc)
         yield Admission("fail-open", waited())
@@ -89,7 +96,10 @@ async def govern(
             # began earlier must finish first, or we would proxy to (or load
             # into) a model the reaper is still removing.
             await reaper.wait_unloaded(model)
-            await adapter.ensure_loaded(model, ctx)
+            if parallel is None:
+                await adapter.ensure_loaded(model, ctx)
+            else:
+                await adapter.ensure_loaded(model, ctx, parallel)
         finally:
             reaper.finish_loading(model)
         reaper.acquire(model)
@@ -100,7 +110,12 @@ async def govern(
         if first_touch and not acquired and reaper.in_flight(model) == 0:
             reaper.unmark_managed(model)
         await broker.done(model)
-        if fail_open and isinstance(exc, Exception) and not isinstance(exc, ModelLoadError):
+        if (
+            fail_open
+            and not getattr(broker, "dynamic_load_sizing", False)
+            and isinstance(exc, Exception)
+            and not isinstance(exc, ModelLoadError)
+        ):
             log.warning("admission: load/acquire error, forwarding ungoverned: %s", exc)
             yield Admission("fail-open", waited())
             return

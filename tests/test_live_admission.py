@@ -491,6 +491,28 @@ async def test_vm_stat_headroom_capped_by_wired_limit_and_fails_closed():
     assert await VmStatHeadroom(run=broken)() is None
 
 
+@pytest.mark.asyncio
+async def test_shadow_headroom_expands_file_pool_but_stays_observational():
+    vm = _vm(
+        free=64,
+        speculative=64,
+        active=256,
+        inactive=128,
+        file=320,
+        wired=64,
+        compressor=0,
+    )
+
+    async def run(args):
+        return vm if args == ["vm_stat"] else "100000"
+
+    probe = VmStatHeadroom(run=run)
+    authoritative = await probe()
+
+    assert authoritative == 2  # free + speculative only at 16 KiB/page
+    assert probe.shadow_headroom_mb == 6  # base 128 + expanded file pool 256 pages
+
+
 def test_live_memory_admission_is_opt_in():
     _, _, default = build_components(LaplacedConfig())
     assert default._headroom is None

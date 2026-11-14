@@ -25,6 +25,7 @@ class LoadedModel:
     last_used_ms: float | None = None
     queued: int | None = None
     context_length: int | None = None
+    parallel: int | None = None
 
 
 @dataclass(frozen=True)
@@ -49,7 +50,7 @@ class LoadCost:
 
 
 class InferenceAdapter(Protocol):
-    # Optional: ``async def load_cost(model_id, context_length) -> LoadCost | None``.
+    # Optional: ``async def load_cost(model_id, context_length, parallel=None)``.
     # The broker uses it for live-memory admission when the adapter provides it.
 
 
@@ -59,8 +60,13 @@ class InferenceAdapter(Protocol):
     async def footprint_mb(self, model_id: str) -> int | None:
         """Return the model footprint in MB, or ``None`` when unknown."""
 
-    async def ensure_loaded(self, model_id: str, context_length: int | None) -> None:
-        """Ensure ``model_id`` is resident at the requested context length."""
+    async def ensure_loaded(
+        self,
+        model_id: str,
+        context_length: int | None,
+        parallel: int | None = None,
+    ) -> None:
+        """Ensure ``model_id`` is resident at the requested dimensions."""
 
     def guard_window_remaining_s(self) -> float | None:
         """Return the active uncertain-load guard duration, if any."""

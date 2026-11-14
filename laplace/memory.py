@@ -74,6 +74,9 @@ class VmStatHeadroom:
     def __init__(self, run: Runner | None = None):
         self._run = run or _run
         self._last_compressor_pages: int | None = None
+        # Observability only. This expanded file-backed estimate never
+        # participates in admission.
+        self.shadow_headroom_mb: int | None = None
 
     async def __call__(self) -> int | None:
         text = await self._run(["vm_stat"])
@@ -103,8 +106,19 @@ class VmStatHeadroom:
         reclaimable = free + speculative + clean_inactive - growth
         headroom_mb = reclaimable * page // _MIB
 
+        # Shadow estimator from the resource-aware sizing plan. Protected-file,
+        # dirty/unavailable, and uncertainty-margin terms are deliberately zero
+        # for this first observational slice.
+        base = free + speculative
+        file_pool = min(active + inactive, max(0, file_backed - speculative))
+        shadow_reclaimable = max(0, base + file_pool - growth)
+        shadow_headroom_mb = shadow_reclaimable * page // _MIB
+
         limit_text = await self._run(["sysctl", "-n", "iogpu.wired_limit_mb"])
         limit = (limit_text or "").strip()
         if limit.isdigit() and int(limit) > 0:
-            headroom_mb = min(headroom_mb, int(limit) - wired * page // _MIB)
+            wired_room_mb = int(limit) - wired * page // _MIB
+            headroom_mb = min(headroom_mb, wired_room_mb)
+            shadow_headroom_mb = min(shadow_headroom_mb, wired_room_mb)
+        self.shadow_headroom_mb = max(0, shadow_headroom_mb)
         return max(0, headroom_mb)
