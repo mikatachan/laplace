@@ -157,7 +157,12 @@ class RemoteBackend:
         if delay_first:
             await asyncio.sleep(PROBE_INTERVAL_S)
         while True:
-            await self.probe_once()
+            try:
+                await self.probe_once()
+            except Exception:  # noqa: BLE001 - keep the background probe alive
+                self.last_probe_at = time.time()
+                self.record_probe_failure("probe-error")
+                log.exception("backend %s probe failed unexpectedly", self.name)
             await asyncio.sleep(PROBE_INTERVAL_S)
 
     async def probe_once(self) -> bool:
@@ -175,7 +180,12 @@ class RemoteBackend:
             },
             separators=(",", ":"),
         ).encode()
-        timeout_s = PROBE_TIMEOUT_S if self.state == "UP" else PROBE_COLD_TIMEOUT_S
+        probe_health = self.ensure_model(self.config.probe_model)
+        timeout_s = (
+            PROBE_TIMEOUT_S
+            if self.state == "UP" and probe_health.state == "UP"
+            else PROBE_COLD_TIMEOUT_S
+        )
         success_url = None
         failure_reason = "probe-failed"
         for base_url in self._ordered_urls():
@@ -242,13 +252,7 @@ class RemoteBackend:
         if self.state == "DISABLED":
             return
         if self.consecutive_failures >= 2:
-            if reason == "probe-connect":
-                self._set_state("DOWN", reason)
-            else:
-                model = self.config.probe_model
-                health = self.ensure_model(model)
-                health.consecutive_failures = self.consecutive_failures
-                self._set_model_state(model, "DOWN", reason)
+            self._set_state("DOWN", reason)
 
     def record_request_failure(
         self, reason: str, model: str | None = None, *, host_wide: bool = False
@@ -355,7 +359,6 @@ class RemoteBackend:
                 return AttemptResult(failure_reason="first-byte")
             if error_message is not None:
                 response.close()
-                self.record_request_failure("upstream-inband-error", model)
                 return AttemptResult(
                     failure_reason="upstream-inband-error",
                     failure_message=error_message,
@@ -409,8 +412,16 @@ async def _inspect_precommit_response(
     response: aiohttp.ClientResponse, stream: bool
 ) -> tuple[bytes, str | None]:
     if not stream:
-        body = await response.read()
-        return body, _error_message_from_bytes(body)
+        buffered = bytearray()
+        while len(buffered) < PRECOMMIT_EVENT_LIMIT:
+            chunk = await response.content.read(
+                PRECOMMIT_EVENT_LIMIT - len(buffered)
+            )
+            if not chunk:
+                body = bytes(buffered)
+                return body, _error_message_from_bytes(body)
+            buffered.extend(chunk)
+        return bytes(buffered), None
 
     content_type = response.headers.get("Content-Type", "").lower()
     buffered = bytearray()
@@ -485,7 +496,7 @@ def _error_message_from_bytes(
         return None
     try:
         value = json.loads(body)
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (UnicodeDecodeError, RecursionError, ValueError):
         if not text_fallback:
             return None
         return _sanitize_error_message(body.decode("utf-8", errors="replace"))
@@ -496,6 +507,8 @@ def _error_message_from_value(value: object) -> str | None:
     if not isinstance(value, dict) or "error" not in value:
         return None
     error = value["error"]
+    if not error:
+        return None
     if isinstance(error, str):
         return _sanitize_error_message(error)
     if isinstance(error, dict) and isinstance(error.get("message"), str):
@@ -505,7 +518,13 @@ def _error_message_from_value(value: object) -> str | None:
 
 def _sanitize_error_message(message: str) -> str:
     message = re.sub(
-        r"(?i)\b(authorization|api[-_ ]?key|token|password)\b\s*[:=]?\s*\S+",
+        r"\x1b(?:\][^\x07]*(?:\x07|\x1b\\)|\[[0-?]*[ -/]*[@-~]|[@-Z\\-_])",
+        "",
+        message,
+    )
+    message = re.sub(
+        r"(?i)\b(authorization|api[-_ ]?key|token|password)\b"
+        r"\s*[:=]?\s*(?:bearer\s+)?\S+",
         r"\1=[redacted]",
         message,
     )
