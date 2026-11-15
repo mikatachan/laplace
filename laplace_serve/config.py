@@ -76,6 +76,12 @@ class LaplacedConfig:
     # managed models even when their estimated credit is below the shortfall,
     # then decide again on measured headroom.
     measured_eviction: bool = False
+    # Opt-in, needs fit_context_admission: when a request's context need costs
+    # more than could ever be freed, serve it at the largest achievable context
+    # instead of queueing until the admit timeout. Also replaces an idle,
+    # smaller resident copy of the same model at once instead of waiting for
+    # the reaper's idle unload.
+    fit_context_best_effort: bool = False
     # Opt-in: end a queued admission when its client disconnects, so no load
     # or eviction runs for a caller that is gone.
     cancel_admission_on_disconnect: bool = False
@@ -190,6 +196,7 @@ class LaplacedConfig:
         for flag in (
             "fit_context_admission",
             "measured_eviction",
+            "fit_context_best_effort",
             "adopt_resident_on_start",
             "cancel_admission_on_disconnect",
         ):
