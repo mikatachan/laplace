@@ -509,3 +509,125 @@ async def test_http_request_loads_at_fitted_context(tmp_path):
         assert resp.status == 200
     fitted = (70000 - 57374 - 5738) * _MIB // (184 * 1024)
     assert adapter.ensure_loaded_calls == [(GLM, fitted)]
+
+
+# --- fit_context_best_effort (GLM canary, 2026-11-14 23:53) --------------------
+# Second turn: need 75533 costs 76685 MB; the empty pool frees 75703 MB
+# (laplaced.log 11580). The first turn's GLM copy is resident, idle, at 69459.
+
+GLM_FIRST_CTX = 69459
+GLM_NEED = 75533
+POOL_MB = 75703
+GLM_CAP = 70071  # largest ctx with load_cost <= POOL_MB (75703 MB)
+
+
+def _idle_glm(ctx=GLM_FIRST_CTX, status="idle"):
+    return loaded_model(GLM, size_bytes=57374 * _MIB, status=status, queued=0,
+                        context_length=ctx)
+
+
+def _best_effort_broker(adapter, reaper, probe, *, best_effort=True, timeout_s=1.0):
+    return ContentionBroker(
+        adapter, reaper, headroom_mb=probe, timeout_s=timeout_s,
+        fit_context=True, measured_eviction=True, best_effort=best_effort,
+    )
+
+
+@pytest.mark.asyncio
+async def test_best_effort_capacity_cap_matches_incident_numbers(tmp_path):
+    adapter = _real_adapter(tmp_path)
+    assert (await adapter.load_cost(GLM, GLM_NEED)).total_mb == 76685
+    assert (await adapter.load_cost(GLM, GLM_CAP)).total_mb <= POOL_MB
+    assert (await adapter.load_cost(GLM, GLM_CAP + 1)).total_mb > POOL_MB
+
+
+@pytest.mark.asyncio
+async def test_best_effort_incident_replaces_idle_copy_and_admits_at_capacity(tmp_path, caplog):
+    adapter = ArchAdapter(tmp_path, loaded=[_idle_glm()])
+    reaper = _managed_reaper(adapter, GLM)
+    # Headroom with the copy resident, then after its unload.
+    probe = Probe(POOL_MB - 75593, POOL_MB)
+    broker = _best_effort_broker(adapter, reaper, probe)
+    with caplog.at_level(logging.INFO, logger="laplace.broker"):
+        result = await broker.admit_sized(GLM, GLM_CTX, need_context=GLM_NEED)
+    assert result == ("admit", GLM_CAP)
+    assert adapter.force_unload_calls == [GLM]
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("reason=need-exceeds-capacity" in m and f"capped_ctx={GLM_CAP}" in m
+               for m in messages)
+    assert any("decision=replace" in m for m in messages)
+
+
+@pytest.mark.asyncio
+async def test_best_effort_nothing_resident_admits_at_fitted_capacity(tmp_path):
+    adapter = ArchAdapter(tmp_path)
+    broker = _best_effort_broker(adapter, Reaper(adapter), Probe(POOL_MB))
+    assert await broker.admit_sized(GLM, GLM_CTX, need_context=GLM_NEED) == ("admit", GLM_CAP)
+    assert adapter.force_unload_calls == []
+
+
+@pytest.mark.asyncio
+async def test_best_effort_admits_onto_copy_at_capacity(tmp_path, caplog):
+    adapter = ArchAdapter(tmp_path, loaded=[_idle_glm(ctx=GLM_CAP)])
+    reaper = _managed_reaper(adapter, GLM)
+    broker = _best_effort_broker(adapter, reaper, Probe(0))
+    with caplog.at_level(logging.INFO, logger="laplace.broker"):
+        result = await broker.admit_sized(GLM, GLM_CTX, need_context=GLM_NEED)
+    assert result == ("admit", GLM_CAP)
+    assert adapter.force_unload_calls == []
+    assert any("reason=need-capped-to-capacity" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_best_effort_replaces_idle_smaller_copy_when_need_is_achievable(tmp_path):
+    adapter = ArchAdapter(tmp_path, loaded=[_idle_glm(ctx=8192)])
+    reaper = _managed_reaper(adapter, GLM)
+    broker = _best_effort_broker(adapter, reaper, Probe(200_000))
+    assert await broker.admit_sized(GLM, GLM_CTX, need_context=20000) == ("admit", GLM_CTX)
+    assert adapter.force_unload_calls == [GLM]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["generating", "in-flight", "unmanaged"])
+async def test_best_effort_never_replaces_busy_or_unmanaged_copy(tmp_path, how):
+    copy = _idle_glm(ctx=8192, status="generating" if how == "generating" else "idle")
+    adapter = ArchAdapter(tmp_path, loaded=[copy])
+    reaper = Reaper(adapter) if how == "unmanaged" else _managed_reaper(adapter, GLM)
+    if how == "in-flight":
+        reaper.acquire(GLM)
+    broker = _best_effort_broker(adapter, reaper, Probe(200_000), timeout_s=0.1)
+    assert await broker.admit_sized(GLM, GLM_CTX, need_context=20000) == ("backpressure", None)
+    assert adapter.force_unload_calls == []
+
+
+@pytest.mark.asyncio
+async def test_best_effort_off_incident_still_queues(tmp_path):
+    adapter = ArchAdapter(tmp_path, loaded=[_idle_glm()])
+    reaper = _managed_reaper(adapter, GLM)
+    broker = _best_effort_broker(
+        adapter, reaper, Probe(POOL_MB - 75593, POOL_MB), best_effort=False, timeout_s=0.1,
+    )
+    assert await broker.admit_sized(GLM, GLM_CTX, need_context=GLM_NEED) == ("backpressure", None)
+    assert adapter.force_unload_calls == []
+
+
+@pytest.mark.asyncio
+async def test_best_effort_off_nothing_resident_still_queues(tmp_path):
+    adapter = ArchAdapter(tmp_path)
+    broker = _best_effort_broker(
+        adapter, Reaper(adapter), Probe(POOL_MB), best_effort=False, timeout_s=0.1,
+    )
+    assert await broker.admit_sized(GLM, GLM_CTX, need_context=GLM_NEED) == ("backpressure", None)
+
+
+def test_best_effort_flag_is_opt_in_validated_and_wired():
+    assert LaplacedConfig().fit_context_best_effort is False
+    _, _, broker = build_components(LaplacedConfig())
+    assert broker._best_effort is False
+    _, _, broker = build_components(LaplacedConfig.from_dict({
+        "live_memory_admission": True, "fit_context_admission": True,
+        "fit_context_best_effort": True,
+    }))
+    assert broker._best_effort is True
+    with pytest.raises(ValueError, match="fit_context_best_effort"):
+        LaplacedConfig.from_dict({"fit_context_best_effort": "yes"})

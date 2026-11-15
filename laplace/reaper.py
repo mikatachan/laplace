@@ -294,6 +294,17 @@ class Reaper:
         )
         return False
 
+    async def unload_for_replace(self, model_id: str) -> bool:
+        """Unload an idle resident copy so it can be reloaded at a larger context.
+
+        Same claim checks as any reaper unload (_unload), plus the adopted-model
+        live recheck.
+        """
+        reason = "broker:replace-smaller-context"
+        if not await self._adopted_guard_allows(model_id, None, reason):
+            return False
+        return await self._unload(model_id, reason=reason)
+
     def is_managed(self, model_id: str) -> bool:
         if not model_id:
             return False
