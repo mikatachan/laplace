@@ -148,8 +148,21 @@ async def _on_startup(app: web.Application) -> None:
         await session.close()
         raise
     await app[FLEET].start()
+    if config.adopt_resident_on_start:
+        await _adopt_resident(app)
     if config.reaper_sweep:
         app[REAPER].start_sweep_loop(config.sweep_interval_s)
+
+
+async def _adopt_resident(app: web.Application) -> None:
+    """Adopt already-resident models as managed. Never fails startup."""
+    try:
+        entries = await app[ADAPTER].list_loaded()
+        adopted = app[REAPER].adopt_resident(entries)
+    except Exception:  # noqa: BLE001 - adoption is best-effort, startup must proceed
+        log.exception("laplaced: adopting resident models at startup failed")
+        return
+    log.info("laplaced: adopted %d resident model(s) as managed: %s", len(adopted), adopted)
 
 
 async def _retry_startup_validation(
