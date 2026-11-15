@@ -308,7 +308,12 @@ Adopted models can be evicted when idle and follow the managed-idle TTL from
 startup. Live-memory admission still skips models the runtime reports as
 busy, and the managed-idle sweep skips models it reports as active. Trade-off: a model that a client
 outside laplaced loaded is adopted too, and is then reaped on laplaced's
-managed-idle TTL rather than the runtime's `lastUsedTime`. A failed listing is
+managed-idle TTL rather than the runtime's `lastUsedTime`. Until laplaced
+serves a request for an adopted model itself, every unload of it first lists
+models again and skips it unless it is still resident, idle, with an empty
+queue and an unchanged `lastUsedTime` (the external path's guard). This
+narrows, but cannot close, the window in which an outside client starts work
+just before `lms unload`. A failed listing is
 logged and startup continues. Rollback: remove the line and restart laplaced.
 
 ## Prior art / where Laplace fits
