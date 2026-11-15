@@ -338,8 +338,13 @@ class ContentionBroker:
         required_ctx = need_context or context_length
         covered = self._covered_by_existing(model_id, required_ctx, entries)
         capped_from = None
+        # One live reading per pass: the cap is sized to fill this snapshot
+        # exactly, so a second vm_stat a few ms later can read 1 MB less and
+        # refuse the capped load with nothing resident (canary 2026-11-15).
+        snapshot = None
         if covered != "admit" and self._best_effort and need_context:
-            cap = await self._capacity_cap(model_id, need_context, entries)
+            snapshot = await self._live_available(entries, resident, context_length)
+            cap = await self._capacity_cap(model_id, need_context, entries, snapshot)
             if cap is not None:
                 log.info(
                     "laplace.broker: load decision model=%s need_ctx=%s capped_ctx=%s "
@@ -418,8 +423,9 @@ class ContentionBroker:
                 context_length,
             )
             return None
-        headroom = await self._headroom()
-        if headroom is None:
+        if snapshot is None:
+            snapshot = await self._live_available(entries, resident, context_length)
+        if snapshot is None:
             log.warning(
                 "laplace.broker: load decision model=%s cost_mb=%s decision=queue "
                 "reason=headroom-unreadable",
@@ -427,9 +433,7 @@ class ContentionBroker:
                 cost.total_mb,
             )
             return None
-
-        inflight_mb, inflight_estimate = await self._inflight_reserve_mb(entries, context_length)
-        pending_mb, pending_estimate = await self._pending_load_mb(resident)
+        headroom, inflight_mb, inflight_estimate, pending_mb, pending_estimate = snapshot
         available = headroom - inflight_mb - pending_mb
         estimate = (*cost.estimate, *inflight_estimate, *pending_estimate)
 
@@ -521,26 +525,41 @@ class ContentionBroker:
             return None
         return copy
 
+    async def _live_available(
+        self, entries: list[LoadedModel], resident: list[str], context_length: int | None
+    ) -> tuple[int, int, tuple[str, ...], int, tuple[str, ...]] | None:
+        """One live headroom reading with the in-flight and pending reserves.
+
+        None when headroom is unreadable.
+        """
+        headroom = await self._headroom()
+        if headroom is None:
+            return None
+        inflight_mb, inflight_estimate = await self._inflight_reserve_mb(entries, context_length)
+        pending_mb, pending_estimate = await self._pending_load_mb(resident)
+        return headroom, inflight_mb, inflight_estimate, pending_mb, pending_estimate
+
     async def _capacity_cap(
-        self, model_id: str, need: int, entries: list[LoadedModel]
+        self,
+        model_id: str,
+        need: int,
+        entries: list[LoadedModel],
+        snapshot: tuple[int, int, tuple[str, ...], int, tuple[str, ...]] | None,
     ) -> int | None:
         """Largest context below ``need`` that can ever fit, when ``need`` cannot.
 
         Capacity is available headroom (after in-flight and pending reserves),
+        taken from ``snapshot`` (the reading admission then decides on),
         plus the full cost of a resident copy of this model, plus the
         weights + overhead of idle evictable models: everything eviction or
         replacement could free now. None when the need fits that capacity, or
         any term is unknown (then today's behaviour: queue).
         """
         need_cost = await self._adapter.load_cost(model_id, need)
-        if need_cost is None:
+        if need_cost is None or snapshot is None:
             return None
-        headroom = await self._headroom()
-        if headroom is None:
-            return None
+        headroom, inflight_mb, _, pending_mb, _ = snapshot
         resident = [entry.id for entry in entries]
-        inflight_mb, _ = await self._inflight_reserve_mb(entries, need)
-        pending_mb, _ = await self._pending_load_mb(resident)
         capacity = headroom - inflight_mb - pending_mb
         evictable_ids = set(self._reaper.evictable_models(resident))
         for entry in entries:
