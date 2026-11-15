@@ -716,3 +716,56 @@ async def test_replace_releases_unloading_claim_on_every_exit(how):
     else:
         assert await reaper.unload_for_replace("glm") is False
     assert not reaper.is_unloading("glm")
+
+
+# --- best-effort cap and admission share one headroom reading (2026-11-15 02:59)
+# After the replace unload, _capacity_cap read 76584 MB and capped need 114331 at
+# 74974 (cost 76584). Admission then read headroom again, got 76583, and queued
+# with shortfall_mb=1 and nothing resident (laplaced.log 02:59:51).
+
+GLM_CANARY3_FIRST_CTX = 69904
+GLM_CANARY3_NEED = 114331
+GLM_CANARY3_CAP = 74974
+
+
+@pytest.mark.asyncio
+async def test_best_effort_cap_and_admission_use_the_same_headroom_reading(tmp_path, caplog):
+    adapter = ArchAdapter(tmp_path, loaded=[_idle_glm(ctx=GLM_CANARY3_FIRST_CTX)])
+    assert (await adapter.load_cost(GLM, GLM_CANARY3_FIRST_CTX)).total_mb == 75673
+    cap_cost = await adapter.load_cost(GLM, GLM_CANARY3_CAP)
+    assert (cap_cost.weights_mb, cap_cost.kv_mb, cap_cost.overhead_mb) == (57374, 13472, 5738)
+    assert cap_cost.total_mb == 76584
+    assert (await adapter.load_cost(GLM, GLM_CANARY3_CAP + 1)).total_mb > 76584
+    reaper = _managed_reaper(adapter, GLM)
+    # Copy resident: the full need (83656) fits headroom + the copy's 75673, so
+    # replace without a cap (log line 02:59:48). After the unload, two readings
+    # 1 MB apart, as the cap and admission lines 7 ms apart show.
+    assert (await adapter.load_cost(GLM, GLM_CANARY3_NEED)).total_mb == 83656
+    probe = Probe(83656 - 75673, 76584, 76583)
+    broker = _best_effort_broker(adapter, reaper, probe, timeout_s=0.1)
+    with caplog.at_level(logging.INFO, logger="laplace.broker"):
+        result = await broker.admit_sized(GLM, GLM_CTX, need_context=GLM_CANARY3_NEED)
+    assert result == ("admit", GLM_CANARY3_CAP)
+    assert adapter.force_unload_calls == [GLM]
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(f"need_ctx={GLM_CANARY3_NEED} decision=replace" in m for m in messages)
+    assert not any("decision=queue" in m for m in messages), messages
+    assert any(f"ctx={GLM_CANARY3_CAP} " in m and "decision=admit" in m
+               and "headroom_mb=76584" in m for m in messages), messages
+
+
+@pytest.mark.asyncio
+async def test_best_effort_cap_recomputed_on_measured_headroom_after_short_eviction(tmp_path):
+    # The cap counts the idle victim's credit; its unload frees less than that.
+    # The next pass must re-cap against the measured reading and load, not
+    # queue on the first cap with nothing left to evict.
+    adapter = ArchAdapter(tmp_path, loaded=[_idle_qwen()])
+    reaper = _managed_reaper(adapter, QWEN)
+    # The first cap, on 60000 + the credit, is larger than the measured one.
+    assert (await adapter.load_cost(GLM, GLM_CANARY3_CAP + 1)).total_mb <= 60000 + QWEN_CREDIT
+    # decide, request_free baseline, after unload, recheck, any later reading
+    probe = Probe(60000, 60000, 76584, 76584, 76583)
+    broker = _best_effort_broker(adapter, reaper, probe, timeout_s=0.1)
+    result = await broker.admit_sized(GLM, GLM_CTX, need_context=GLM_CANARY3_NEED)
+    assert adapter.force_unload_calls == [QWEN]
+    assert result == ("admit", GLM_CANARY3_CAP)
