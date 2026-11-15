@@ -46,6 +46,8 @@ def build_components(
             if config.live_memory_admission
             else None
         ),
+        fit_context=config.fit_context_admission,
+        measured_eviction=config.measured_eviction,
     )
     return adapter, reaper, broker
 
