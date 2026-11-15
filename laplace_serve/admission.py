@@ -42,6 +42,7 @@ async def govern(
     ctx: int | None,
     tier: str,
     fail_open: bool,
+    need_ctx: int | None = None,
 ) -> AsyncIterator[Admission]:
     """Govern one request across its lifecycle.
 
@@ -52,6 +53,9 @@ async def govern(
 
     Errors raised by the caller's governed body are propagated unchanged; only
     daemon-internal failures (broker/reaper/adapter) are subject to fail-open.
+
+    ``need_ctx`` (fit-sized context admission): the job's estimated context
+    need. The broker then picks the context, and the load uses that context.
     """
     loop = asyncio.get_running_loop()
     start = loop.time()
@@ -65,7 +69,10 @@ async def govern(
         return
 
     try:
-        decision = await broker.admit(model, ctx, tier)
+        if need_ctx is None:
+            decision = await broker.admit(model, ctx, tier)
+        else:
+            decision, ctx = await broker.admit_sized(model, ctx, tier, need_context=need_ctx)
     except Exception as exc:  # noqa: BLE001 - broker failure is daemon-internal
         if not fail_open:
             raise

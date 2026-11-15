@@ -65,6 +65,17 @@ class LaplacedConfig:
     # The measured purge shortfall was 4.57% (36002 MiB pool versus 34358 MiB
     # freed); 0.05 is the smallest margin that covers it in MiB.
     file_cache_reclaim_margin: float = 0.05
+    # Opt-in, needs live_memory_admission: when the configured context does
+    # not fit, load at the largest context that does, if it covers the job's
+    # estimated need (prompt + output allowance).
+    fit_context_admission: bool = False
+    # Output allowance when a request sends no max_tokens. No existing setting
+    # covered it; 8192 is a starting value, not a measurement.
+    fit_context_min_output_tokens: int = 8192
+    # Opt-in, needs live_memory_admission: once per admission, evict idle
+    # managed models even when their estimated credit is below the shortfall,
+    # then decide again on measured headroom.
+    measured_eviction: bool = False
     max_concurrent: int = 2
     admit_timeout_s: float = 120.0
     fail_open: bool = True
@@ -169,6 +180,14 @@ class LaplacedConfig:
             raw["live_memory_admission"], bool
         ):
             raise ValueError("laplaced config: live_memory_admission must be a boolean")
+        for flag in ("fit_context_admission", "measured_eviction"):
+            if flag in raw and not isinstance(raw[flag], bool):
+                raise ValueError(f"laplaced config: {flag} must be a boolean")
+        min_output = raw.get("fit_context_min_output_tokens", 8192)
+        if isinstance(min_output, bool) or not isinstance(min_output, int) or min_output <= 0:
+            raise ValueError(
+                "laplaced config: fit_context_min_output_tokens must be a positive integer"
+            )
         margin = raw.get("file_cache_reclaim_margin", 0.05)
         if (
             isinstance(margin, bool)

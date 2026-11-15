@@ -210,16 +210,21 @@ async def _governed(request: web.Request) -> web.StreamResponse:
     model = config.canonical_model_id(requested_model)
     forwarded_body = _canonicalize_forwarded_model(body, requested_model, model)
     ctx = config.model_context.get(model, config.default_context_length) if model else None
+    need_ctx = (
+        _estimate_need_tokens(body, config.fit_context_min_output_tokens)
+        if model and config.fit_context_admission
+        else None
+    )
 
     tracked = None
     if _upstream_path(request) == "/v1/chat/completions":
         tracked = request.app[INFLIGHT].start(origin, model, stream)
     if tracked is None:
-        return await _route(request, origin, tier, model, stream, ctx, forwarded_body)
+        return await _route(request, origin, tier, model, stream, ctx, forwarded_body, need_ctx)
     key, record = tracked
     request[RECORD] = record
     try:
-        return await _route(request, origin, tier, model, stream, ctx, forwarded_body)
+        return await _route(request, origin, tier, model, stream, ctx, forwarded_body, need_ctx)
     finally:
         request.app[INFLIGHT].finish(key)
 
@@ -232,11 +237,12 @@ async def _route(
     stream: bool,
     ctx: int | None,
     forwarded_body: bytes,
+    need_ctx: int | None = None,
 ) -> web.StreamResponse:
     for backend_name in request.app[FLEET].route(origin, model):
         if backend_name == "axis":
             return await _forward_axis(
-                request, origin, tier, model, stream, ctx, forwarded_body
+                request, origin, tier, model, stream, ctx, forwarded_body, need_ctx
             )
         result = await request.app[FLEET].backends[backend_name].forward(
             request, _upstream_path(request), forwarded_body
@@ -267,6 +273,7 @@ async def _forward_axis(
     stream: bool,
     ctx: int | None,
     forwarded_body: bytes,
+    need_ctx: int | None = None,
 ) -> web.StreamResponse:
     config = request.app[CONFIG]
 
@@ -279,6 +286,7 @@ async def _forward_axis(
             ctx=ctx,
             tier=tier,
             fail_open=config.fail_open,
+            need_ctx=need_ctx,
         ) as admission:
             log.info(
                 "admission origin=%s tier=%s model=%s decision=%s wait_ms=%s stream=%s",
@@ -458,6 +466,50 @@ def _extract_model_stream(body: bytes) -> tuple[str | None, bool]:
     model = payload.get("model")
     model = model if isinstance(model, str) and model else None
     return model, bool(payload.get("stream"))
+
+
+# Output-limit fields across the governed routes: chat/completions, the legacy
+# completions route, and responses.
+_OUTPUT_LIMIT_KEYS = ("max_tokens", "max_completion_tokens", "max_output_tokens")
+
+
+# Chat-template tokens that have no bytes in the request body: default system
+# prompts and tool-calling instructions. Worst seen: Qwen3-Coder rendered a
+# 222-byte request with one tool to 257 tokens (see _estimate_need_tokens).
+_TEMPLATE_ALLOWANCE_TOKENS = 1024
+
+
+def _estimate_need_tokens(body: bytes, min_output_tokens: int) -> int:
+    """Upper-bound context a request needs: prompt plus output allowance.
+
+    Prompt: the request body's UTF-8 byte count plus
+    ``_TEMPLATE_ALLOWANCE_TOKENS``. Without a tokenizer (the core is
+    stdlib-only) bytes are the bound: byte-level BPE and byte-fallback
+    SentencePiece emit at most one token per byte of text, so 12,000 random
+    digits cost about 12,000 tokens on Qwen and Gemma. JSON escaping makes the
+    body longer than the strings the template renders, and each message's JSON
+    syntax (about 25 bytes) outweighs its template tokens. Offline, five local
+    tokenizers (GLM-4.5-Air, gpt-oss, Qwen3-Coder, Qwen3-Next, Gemma 4) on 15
+    adversarial bodies (digits, punctuation, CJK, emoji, 400 empty messages,
+    300 tools, 200-parameter schemas) never rendered more than 35 tokens above
+    body bytes. An empirical bound, not a proof for every template. For
+    English it is about 4.3x the real count; a need above the configured
+    context is treated as the configured context.
+    Output: the caller's limit when it sends one, else ``min_output_tokens``.
+    """
+    prompt = len(body) + _TEMPLATE_ALLOWANCE_TOKENS
+    output = min_output_tokens
+    try:
+        payload = json.loads(body) if body else None
+    except (ValueError, UnicodeDecodeError):
+        payload = None
+    if isinstance(payload, dict):
+        for key in _OUTPUT_LIMIT_KEYS:
+            value = payload.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                output = value
+                break
+    return prompt + output
 
 
 def _canonicalize_forwarded_model(
