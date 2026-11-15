@@ -543,7 +543,9 @@ async def test_best_effort_capacity_cap_matches_incident_numbers(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_best_effort_incident_replaces_idle_copy_and_admits_at_capacity(tmp_path, caplog):
+async def test_best_effort_incident_keeps_copy_when_reload_gains_little(tmp_path, caplog):
+    # Reloading at GLM_CAP would gain 612 tokens (110 MB) for an ~18 s reload.
+    # The cap credits the copy's weights + overhead only, so it is the copy.
     adapter = ArchAdapter(tmp_path, loaded=[_idle_glm()])
     reaper = _managed_reaper(adapter, GLM)
     # Headroom with the copy resident, then after its unload.
@@ -551,12 +553,13 @@ async def test_best_effort_incident_replaces_idle_copy_and_admits_at_capacity(tm
     broker = _best_effort_broker(adapter, reaper, probe)
     with caplog.at_level(logging.INFO, logger="laplace.broker"):
         result = await broker.admit_sized(GLM, GLM_CTX, need_context=GLM_NEED)
-    assert result == ("admit", GLM_CAP)
-    assert adapter.force_unload_calls == [GLM]
+    assert result == ("admit", GLM_FIRST_CTX)
+    assert adapter.force_unload_calls == []
     messages = [r.getMessage() for r in caplog.records]
-    assert any("reason=need-exceeds-capacity" in m and f"capped_ctx={GLM_CAP}" in m
+    assert any("reason=need-exceeds-capacity" in m and f"capped_ctx={GLM_FIRST_CTX}" in m
                for m in messages)
-    assert any("decision=replace" in m for m in messages)
+    assert any("reason=need-capped-to-capacity" in m for m in messages)
+    assert not any("decision=replace" in m for m in messages)
 
 
 @pytest.mark.asyncio
@@ -685,7 +688,7 @@ class _PausedAdoptedAdapter(FakeAdapter):
 
     async def load_cost(self, model_id, context_length):
         return LoadCost(
-            weights_mb=1_000, kv_mb=(context_length or 0) // 100, overhead_mb=100,
+            weights_mb=1_000, kv_mb=(context_length or 0) // 4, overhead_mb=100,
             context_length=context_length, parallel=1,
         )
 
@@ -773,11 +776,12 @@ async def test_best_effort_cap_and_admission_use_the_same_headroom_reading(tmp_p
     assert cap_cost.total_mb == 76584
     assert (await adapter.load_cost(GLM, GLM_CANARY3_CAP + 1)).total_mb > 76584
     reaper = _managed_reaper(adapter, GLM)
-    # Copy resident: the full need (83656) fits headroom + the copy's 75673, so
-    # replace without a cap (log line 02:59:48). After the unload, two readings
-    # 1 MB apart, as the cap and admission lines 7 ms apart show.
+    # Copy resident: the full need (83656) fits headroom + the copy's weights +
+    # overhead (63112), so replace without a cap (log line 02:59:48; the
+    # pre-unload headroom is set so the need fits). After the unload, two
+    # readings 1 MB apart, as the cap and admission lines 7 ms apart show.
     assert (await adapter.load_cost(GLM, GLM_CANARY3_NEED)).total_mb == 83656
-    probe = Probe(83656 - 75673, 76584, 76583)
+    probe = Probe(83656 - 63112, 76584, 76583)
     broker = _best_effort_broker(adapter, reaper, probe, timeout_s=0.1)
     with caplog.at_level(logging.INFO, logger="laplace.broker"):
         result = await broker.admit_sized(GLM, GLM_CTX, need_context=GLM_CANARY3_NEED)
@@ -805,3 +809,77 @@ async def test_best_effort_cap_recomputed_on_measured_headroom_after_short_evict
     result = await broker.admit_sized(GLM, GLM_CTX, need_context=GLM_CANARY3_NEED)
     assert adapter.force_unload_calls == [QWEN]
     assert result == ("admit", GLM_CANARY3_CAP)
+
+
+# --- best-effort replace churn (GLM canary, 2026-11-15 03:15-03:33) ------------
+# Six replaces in one agent run, each ~3 s unload + ~15 s load. The cap credited
+# the copy's full cost; its unload freed 6.3-8.6 GB less (03:18, 03:21), and at
+# 03:32 the 112183 copy was replaced by a 102511 load.
+
+GLM_WO = 57374 + 5738  # GLM weights + overhead: the copy's credit
+GLM_DRIFT_MB = 1738  # largest headroom drop between turns (83270 -> 81532)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "resident_ctx, need, pre_unload, post_unload",
+    [
+        # 03:32:30. No cap was logged before the replace, so the need fit the
+        # old capacity: pre >= 86664 - 83270. At most 81532 - GLM_WO if the
+        # unload freed at least weights + overhead.
+        (112183, 131072, 3394, 81532),
+        (112183, 131072, 81532 - GLM_WO, 81532),
+        # 03:18:48. capped_ctx=130626 fixes pre at 86584 - 76670 = 9914.
+        (75453, 131072, 9914, 77956),
+    ],
+)
+async def test_best_effort_replace_canary_keeps_copy_instead_of_reloading(
+    tmp_path, caplog, resident_ctx, need, pre_unload, post_unload
+):
+    adapter = ArchAdapter(tmp_path, loaded=[_idle_glm(ctx=resident_ctx)])
+    assert (await adapter.load_cost(GLM, 112183)).total_mb == 83270
+    assert (await adapter.load_cost(GLM, 102511)).total_mb == 81532
+    reaper = _managed_reaper(adapter, GLM)
+    probe = Probe(pre_unload, post_unload)
+    broker = _best_effort_broker(adapter, reaper, probe, timeout_s=0.1)
+    with caplog.at_level(logging.INFO, logger="laplace.broker"):
+        result = await broker.admit_sized(GLM, GLM_CTX, need_context=need)
+    assert result == ("admit", resident_ctx)
+    assert adapter.force_unload_calls == []
+    assert not any("decision=replace" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_best_effort_small_replace_gain_keeps_copy(tmp_path, caplog):
+    # 03:18: 75453 -> 82610 is 1286 MB of KV. Even when the cap predicts it
+    # exactly, that is below REPLACE_MIN_GAIN_MB: no reload.
+    adapter = ArchAdapter(tmp_path, loaded=[_idle_glm(ctx=75453)])
+    assert (await adapter.load_cost(GLM, 82610)).total_mb == 77956
+    reaper = _managed_reaper(adapter, GLM)
+    probe = Probe(77956 - GLM_WO, 77956)
+    broker = _best_effort_broker(adapter, reaper, probe, timeout_s=0.1)
+    with caplog.at_level(logging.INFO, logger="laplace.broker"):
+        result = await broker.admit_sized(GLM, GLM_CTX, need_context=GLM_CTX)
+    assert result == ("admit", 75453)
+    assert adapter.force_unload_calls == []
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("capped_ctx=82610" in m for m in messages), messages
+    assert any("reason=replace-gain-below-threshold resident_ctx=75453" in m
+               for m in messages), messages
+
+
+@pytest.mark.asyncio
+async def test_best_effort_replace_at_threshold_never_reloads_smaller(tmp_path):
+    # The smallest predicted gain that replaces, then the largest drop seen
+    # between turns: the reload is still larger than the copy.
+    from laplace.broker import REPLACE_MIN_GAIN_MB
+
+    adapter = ArchAdapter(tmp_path, loaded=[_idle_glm(ctx=75453)])
+    copy_cost = (await adapter.load_cost(GLM, 75453)).total_mb
+    reaper = _managed_reaper(adapter, GLM)
+    pre = copy_cost + REPLACE_MIN_GAIN_MB - GLM_WO
+    post = copy_cost + REPLACE_MIN_GAIN_MB - GLM_DRIFT_MB
+    broker = _best_effort_broker(adapter, reaper, Probe(pre, post), timeout_s=0.1)
+    decision, ctx = await broker.admit_sized(GLM, GLM_CTX, need_context=GLM_CTX)
+    assert adapter.force_unload_calls == [GLM]
+    assert decision == "admit" and ctx > 75453
