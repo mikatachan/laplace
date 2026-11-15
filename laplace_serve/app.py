@@ -278,6 +278,12 @@ async def _route(
     return web.json_response({"error": "no backend available"}, status=502)
 
 
+def _client_gone(request: web.Request) -> bool:
+    """The proxy's disconnect test (proxy._unless_disconnected), used while queued."""
+    transport = request.transport
+    return transport is None or transport.is_closing()
+
+
 async def _forward_axis(
     request: web.Request,
     origin: str,
@@ -300,6 +306,11 @@ async def _forward_axis(
             tier=tier,
             fail_open=config.fail_open,
             need_ctx=need_ctx,
+            abandoned=(
+                (lambda: _client_gone(request))
+                if config.cancel_admission_on_disconnect
+                else None
+            ),
         ) as admission:
             log.info(
                 "admission origin=%s tier=%s model=%s decision=%s wait_ms=%s stream=%s",
@@ -310,6 +321,10 @@ async def _forward_axis(
                 admission.wait_ms,
                 stream,
             )
+            if admission.decision == "abandoned":
+                # aiohttp treats a ConnectionError from a handler as a premature
+                # client disconnection and drops the connection quietly.
+                raise ConnectionResetError("downstream client disconnected")
             if not admission.proxy:
                 return web.json_response(
                     {"error": "inference pool at capacity, retry later"},

@@ -289,6 +289,20 @@ measured_eviction = true
 
 Rollback: set either flag to `false` (or delete the line) and restart laplaced.
 
+### Opt-in: cancel a queued admission when its client disconnects
+
+`cancel_admission_on_disconnect = true` (off by default). aiohttp does not
+cancel a handler when its client disconnects, and the proxy's disconnect watch
+only covers forwarding. Without this flag a request queued for memory keeps
+being evaluated after its client left, and can still trigger an eviction and a
+load for nobody. With it, the queued request checks the connection before each
+evaluation, before any eviction, and every second while queued; once the client
+is gone it leaves the queue (`decision=abandoned` in the log), holds no
+reservation, and starts no eviction or load. An eviction or load that is
+already running is not interrupted. It is off by default because it can change
+timing for live callers: today a retry can ride on a load that a dead request
+started. Rollback: remove the line and restart laplaced.
+
 ### Opt-in adoption of resident models at startup
 
 Off by default. Which models laplaced manages is held in memory, so after a
