@@ -76,6 +76,9 @@ class LaplacedConfig:
     # managed models even when their estimated credit is below the shortfall,
     # then decide again on measured headroom.
     measured_eviction: bool = False
+    # Opt-in: end a queued admission when its client disconnects, so no load
+    # or eviction runs for a caller that is gone.
+    cancel_admission_on_disconnect: bool = False
     # Opt-in: at startup, claim every model already resident (except
     # keep_loaded) as managed, so models the previous laplaced process loaded
     # stay evictable after a restart instead of reading as external tenants.
@@ -184,7 +187,12 @@ class LaplacedConfig:
             raw["live_memory_admission"], bool
         ):
             raise ValueError("laplaced config: live_memory_admission must be a boolean")
-        for flag in ("fit_context_admission", "measured_eviction", "adopt_resident_on_start"):
+        for flag in (
+            "fit_context_admission",
+            "measured_eviction",
+            "adopt_resident_on_start",
+            "cancel_admission_on_disconnect",
+        ):
             if flag in raw and not isinstance(raw[flag], bool):
                 raise ValueError(f"laplaced config: {flag} must be a boolean")
         min_output = raw.get("fit_context_min_output_tokens", 8192)

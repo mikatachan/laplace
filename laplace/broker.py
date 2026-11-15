@@ -16,6 +16,9 @@ log = logging.getLogger(__name__)
 FLAT_MARGIN_MB = 3072
 DEFAULT_TIMEOUT_S = 120.0
 DEFAULT_MAX_CONCURRENT_LMS = 2
+# How often a parked admission checks ``abandoned`` (same cadence as the proxy's
+# disconnect watch, laplace_serve/proxy.py DISCONNECT_POLL_S).
+ABANDON_POLL_S = 1.0
 
 
 class ContentionBroker:
@@ -66,8 +69,12 @@ class ContentionBroker:
         model_id: str,
         context_length: int | None = None,
         priority: str = "scheduled",
+        *,
+        abandoned: Callable[[], bool] | None = None,
     ) -> str:
-        decision, _ = await self.admit_sized(model_id, context_length, priority)
+        decision, _ = await self.admit_sized(
+            model_id, context_length, priority, abandoned=abandoned
+        )
         return decision
 
     async def admit_sized(
@@ -77,8 +84,16 @@ class ContentionBroker:
         priority: str = "scheduled",
         *,
         need_context: int | None = None,
+        abandoned: Callable[[], bool] | None = None,
     ) -> tuple[str, int | None]:
         """Admit like ``admit`` and also return the context to load or reuse at.
+
+        ``abandoned`` (optional): returns True once the caller no longer wants
+        the result, e.g. its client disconnected. It is checked before each
+        evaluation, before any eviction, and every ABANDON_POLL_S while parked;
+        when True the wait ends with ``("abandoned", None)``, no reservation
+        is held, and no eviction is started. An eviction already running is
+        never interrupted.
 
         ``context_length`` is the configured context. ``need_context`` is the
         job's own estimate (prompt plus output allowance). With ``fit_context``
@@ -112,6 +127,8 @@ class ContentionBroker:
         measured_eviction_used = False
 
         while True:
+            if abandoned is not None and abandoned():
+                return self._abandon(model_id, "before-evaluation")
             async with self._lock:
                 decision = await self._try_admit(
                     model_id,
@@ -138,6 +155,8 @@ class ContentionBroker:
                     needed_mb = None
                     evict_prio = None
             if needed_mb is not None:
+                if abandoned is not None and abandoned():
+                    return self._abandon(model_id, "before-eviction")
                 try:
                     if self._headroom is not None:
                         await self._reaper.request_free(
@@ -165,7 +184,12 @@ class ContentionBroker:
                     self._wake()
 
             try:
-                await asyncio.wait_for(fut, timeout=remaining)
+                if abandoned is None:
+                    await asyncio.wait_for(fut, timeout=remaining)
+                elif await self._park_or_abandon(fut, remaining, abandoned):
+                    async with self._lock:
+                        self._remove_waiter(entry)
+                    return self._abandon(model_id, "while-queued")
             except asyncio.TimeoutError:
                 async with self._lock:
                     self._remove_waiter(entry)
@@ -183,11 +207,49 @@ class ContentionBroker:
                     try:
                         async with self._lock:
                             self._remove_waiter(entry)
+                            if abandoned is not None:
+                                # asyncio.wait does not cancel fut: drop it, and
+                                # pass on a wake that already reached it.
+                                if fut.done():
+                                    self._wake()
+                                else:
+                                    fut.cancel()
                         break
                     except asyncio.CancelledError:
                         continue
                 raise
             evicted_this_cycle = False
+
+    @staticmethod
+    async def _park_or_abandon(
+        fut: asyncio.Future, remaining: float, abandoned: Callable[[], bool]
+    ) -> bool:
+        """Wait for a wake like ``wait_for(fut, remaining)``, polling ``abandoned``.
+
+        True when abandoned first; raises TimeoutError when ``remaining`` runs out.
+        """
+        loop = asyncio.get_running_loop()
+        end = loop.time() + remaining
+        while not fut.done():
+            if abandoned():
+                return True
+            left = end - loop.time()
+            if left <= 0:
+                raise asyncio.TimeoutError
+            await asyncio.wait({fut}, timeout=min(ABANDON_POLL_S, left))
+        return False
+
+    def _abandon(self, model_id: str, stage: str) -> tuple[str, None]:
+        log.info(
+            "laplace.broker: load decision model=%s decision=abandoned "
+            "reason=caller-gone stage=%s",
+            model_id,
+            stage,
+        )
+        # This admission may hold a wake it will not use: pass one on. A spare
+        # wake only makes the head waiter evaluate once more.
+        self._wake()
+        return "abandoned", None
 
     async def done(self, model_id: str) -> None:
         if not model_id:
