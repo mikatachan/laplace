@@ -289,6 +289,24 @@ measured_eviction = true
 
 Rollback: set either flag to `false` (or delete the line) and restart laplaced.
 
+`fit_context_best_effort = true` (also off by default, needs
+`fit_context_admission`) changes two waits:
+
+- **Need above capacity.** Capacity is available headroom, plus the full cost
+  of a resident copy of the same model, plus the weights + overhead of idle
+  evictable models. When the need costs more than that, waiting cannot help,
+  so the need is capped at the largest context that fits capacity (log
+  `reason=need-exceeds-capacity capped_ctx=...`). A resident copy at or above
+  the cap is used as is (`reason=need-capped-to-capacity`); otherwise the
+  request loads at the fitted context. Busy and external models count as
+  unavailable, so a request can be capped when waiting for them would have
+  given it the full need. The need is an upper bound, so a capped request
+  usually still fits; if its prompt does not, LM Studio fails it.
+- **Idle smaller copy.** A resident copy of the model below the need is
+  unloaded at once (`decision=replace`) when it is idle, managed and has
+  nothing in flight or reserved, instead of waiting for the reaper's idle
+  unload. At most once per request.
+
 ### Opt-in: cancel a queued admission when its client disconnects
 
 `cancel_admission_on_disconnect = true` (off by default). aiohttp does not
@@ -296,10 +314,10 @@ cancel a handler when its client disconnects, and the proxy's disconnect watch
 only covers forwarding. Without this flag a request queued for memory keeps
 being evaluated after its client left, and can still trigger an eviction and a
 load for nobody. With it, the queued request checks the connection before each
-evaluation, before any eviction, and every second while queued; once the client
-is gone it leaves the queue (`decision=abandoned` in the log), holds no
-reservation, and starts no eviction or load. An eviction or load that is
-already running is not interrupted. It is off by default because it can change
+evaluation, before any eviction or replace unload, and every second while
+queued; once the client is gone it leaves the queue (`decision=abandoned` in
+the log), holds no reservation, and starts no eviction, replace or load. An
+eviction, replace or load that is already running is not interrupted. It is off by default because it can change
 timing for live callers: today a retry can ride on a load that a dead request
 started. Rollback: remove the line and restart laplaced.
 
