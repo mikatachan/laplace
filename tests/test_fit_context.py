@@ -589,6 +589,42 @@ async def test_best_effort_replaces_idle_smaller_copy_when_need_is_achievable(tm
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("when", ["before-replace", "during-replace"])
+async def test_best_effort_replace_and_abandoned_caller(tmp_path, when):
+    """cancel_admission_on_disconnect x best effort: a caller gone before the
+    replace starts no unload; a replace already running is not interrupted."""
+    adapter = ArchAdapter(tmp_path, loaded=[_idle_glm(ctx=8192)])
+    reaper = _managed_reaper(adapter, GLM)
+    broker = _best_effort_broker(adapter, reaper, Probe(200_000))
+    gone = False
+    calls = 0
+
+    def abandoned():
+        nonlocal calls
+        calls += 1
+        # before-replace: present for the evaluation, gone at the replace check.
+        return gone or (when == "before-replace" and calls > 1)
+
+    real_unload = adapter.force_unload
+
+    async def unload_then_leave(model_id, **kwargs):
+        nonlocal gone
+        gone = True  # the client leaves while the unload runs
+        return await real_unload(model_id, **kwargs)
+
+    adapter.force_unload = unload_then_leave
+    result = await broker.admit_sized(GLM, GLM_CTX, need_context=20000, abandoned=abandoned)
+    assert result == ("abandoned", None)
+    assert broker._active_calls() == 0
+    if when == "before-replace":
+        assert adapter.force_unload_calls == []
+        assert GLM in adapter.loaded
+    else:
+        assert adapter.force_unload_calls == [GLM]
+        assert GLM not in adapter.loaded
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("how", ["generating", "in-flight", "unmanaged"])
 async def test_best_effort_never_replaces_busy_or_unmanaged_copy(tmp_path, how):
     copy = _idle_glm(ctx=8192, status="generating" if how == "generating" else "idle")

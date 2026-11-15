@@ -6,7 +6,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import AsyncIterator
+from typing import AsyncIterator, Callable
 
 from laplace.adapter import InferenceAdapter, ModelLoadError
 from laplace.broker import ContentionBroker
@@ -19,9 +19,9 @@ log = logging.getLogger(__name__)
 class Admission:
     """Outcome of the admission decision for one request.
 
-    ``decision`` is one of admit, backpressure, or fail-open. ``proxy`` is False
-    only for backpressure; admit and fail-open both forward upstream (fail-open
-    forwards ungoverned).
+    ``decision`` is one of admit, backpressure, fail-open, or abandoned.
+    ``proxy`` is False for backpressure and abandoned (the client is gone);
+    admit and fail-open both forward upstream (fail-open forwards ungoverned).
     """
 
     decision: str
@@ -29,7 +29,7 @@ class Admission:
 
     @property
     def proxy(self) -> bool:
-        return self.decision != "backpressure"
+        return self.decision not in ("backpressure", "abandoned")
 
 
 @asynccontextmanager
@@ -43,6 +43,7 @@ async def govern(
     tier: str,
     fail_open: bool,
     need_ctx: int | None = None,
+    abandoned: Callable[[], bool] | None = None,
 ) -> AsyncIterator[Admission]:
     """Govern one request across its lifecycle.
 
@@ -56,6 +57,11 @@ async def govern(
 
     ``need_ctx`` (fit-sized context admission): the job's estimated context
     need. The broker then picks the context, and the load uses that context.
+
+    ``abandoned`` (cancel_admission_on_disconnect): True once the client is
+    gone. The admission wait then ends without a load or eviction
+    (``decision="abandoned"``). It is also checked once after admission,
+    before the load starts; a load already running is not interrupted.
     """
     loop = asyncio.get_running_loop()
     start = loop.time()
@@ -69,10 +75,18 @@ async def govern(
         return
 
     try:
-        if need_ctx is None:
-            decision = await broker.admit(model, ctx, tier)
+        if abandoned is None:
+            # Unchanged call shape when the flag is off.
+            if need_ctx is None:
+                decision = await broker.admit(model, ctx, tier)
+            else:
+                decision, ctx = await broker.admit_sized(model, ctx, tier, need_context=need_ctx)
+        elif need_ctx is None:
+            decision = await broker.admit(model, ctx, tier, abandoned=abandoned)
         else:
-            decision, ctx = await broker.admit_sized(model, ctx, tier, need_context=need_ctx)
+            decision, ctx = await broker.admit_sized(
+                model, ctx, tier, need_context=need_ctx, abandoned=abandoned
+            )
     except Exception as exc:  # noqa: BLE001 - broker failure is daemon-internal
         if not fail_open:
             raise
@@ -80,8 +94,18 @@ async def govern(
         yield Admission("fail-open", waited())
         return
 
+    if decision == "abandoned":
+        yield Admission("abandoned", waited())
+        return
+
     if decision != "admit":
         yield Admission("backpressure", waited())
+        return
+
+    if abandoned is not None and abandoned():
+        # Admitted just as the client left: release before any load.
+        await broker.done(model)
+        yield Admission("abandoned", waited())
         return
 
     # Admitted: a reservation is now held and must be released via broker.done.

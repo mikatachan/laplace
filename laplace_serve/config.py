@@ -82,6 +82,9 @@ class LaplacedConfig:
     # smaller resident copy of the same model at once instead of waiting for
     # the reaper's idle unload.
     fit_context_best_effort: bool = False
+    # Opt-in: end a queued admission when its client disconnects, so no load
+    # or eviction runs for a caller that is gone.
+    cancel_admission_on_disconnect: bool = False
     # Opt-in: at startup, claim every model already resident (except
     # keep_loaded) as managed, so models the previous laplaced process loaded
     # stay evictable after a restart instead of reading as external tenants.
@@ -195,6 +198,7 @@ class LaplacedConfig:
             "measured_eviction",
             "fit_context_best_effort",
             "adopt_resident_on_start",
+            "cancel_admission_on_disconnect",
         ):
             if flag in raw and not isinstance(raw[flag], bool):
                 raise ValueError(f"laplaced config: {flag} must be a boolean")
