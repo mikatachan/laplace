@@ -45,6 +45,9 @@ class Reaper:
         self._broker = None
         self._ext_idle_sweeps: dict[str, int] = {}
         self._ext_last_used_seen: dict[str, float] = {}
+        # Models adopted at startup that laplaced has not yet served itself. An
+        # outside client may own them, so each unload rechecks live activity.
+        self._adopted: set[str] = set()
 
     def set_broker(self, broker) -> None:
         self._broker = broker
@@ -61,6 +64,8 @@ class Reaper:
         if not model_id:
             return
         resolved = self._resolve_acquire_model_id(model_id)
+        self._clear_adopted(model_id)
+        self._clear_adopted(resolved)
         self._track_base_instance(resolved)
         self._mark_managed(resolved)
         self._mark_managed(model_id)
@@ -210,6 +215,84 @@ class Reaper:
         """
         self._mark_managed(model_id)
         self._last_used[model_id] = time.monotonic()
+
+    def adopt_resident(self, entries: list[LoadedModel]) -> list[str]:
+        """Claim models already resident at startup as daemon-managed.
+
+        Managed state lives only in memory, so after a restart every model the
+        previous process loaded reads as external: never an eviction victim,
+        unloaded only by the external-idle sweep (TTL plus sustained sweeps).
+        Adopting them makes idle ones evictable again. Trade-off: a model that
+        a client outside laplaced loaded is adopted too, and then follows the
+        managed-idle TTL instead of the runtime's lastUsedTime.
+        """
+        adopted: list[str] = []
+        for entry in entries:
+            if not entry.id or self._is_keep_loaded(entry.id):
+                continue
+            self.mark_managed(entry.id)
+            self._adopted.add(entry.id)
+            adopted.append(entry.id)
+        return adopted
+
+    def _is_adopted(self, model_id: str) -> bool:
+        if not model_id:
+            return False
+        return model_id in self._adopted or self.adapter.base_id(model_id) in self._adopted
+
+    def _clear_adopted(self, model_id: str) -> None:
+        """laplaced is serving this model itself: it is no longer only adopted."""
+        if not model_id:
+            return
+        base_id = self.adapter.base_id(model_id)
+        for adopted in [m for m in self._adopted if self.adapter.base_id(m) == base_id]:
+            self._adopted.discard(adopted)
+
+    async def _adopted_unload_blocked(
+        self, model_id: str, seen: LoadedModel | None
+    ) -> str | None:
+        """Fresh runtime check before unloading an adopted model.
+
+        Same guard as the external-idle path: the model must still be resident,
+        idle, with a known empty queue, and its lastUsedTime must not have
+        advanced past ``seen`` (the snapshot it was selected from). Returns the
+        reason to skip, or None. Narrows, but cannot close, the window in which
+        an outside client starts work before ``lms unload`` runs.
+        """
+        fresh = next(
+            (entry for entry in await self.adapter.list_loaded() if entry.id == model_id),
+            None,
+        )
+        if fresh is None:
+            return "no longer resident"
+        status = self._entry_status(fresh)
+        if status != "idle":
+            return f"status={status or 'unknown'}"
+        queued = self._entry_queued(fresh)
+        if queued is None or queued > 0:
+            return f"queued={queued if queued is not None else 'unknown'}"
+        fresh_last = self._entry_last_used_ms(fresh)
+        seen_last = self._entry_last_used_ms(seen) if seen is not None else None
+        if fresh_last is not None and seen_last is not None and fresh_last > seen_last:
+            return "lastUsedTime advanced"
+        return None
+
+    async def _adopted_guard_allows(
+        self, model_id: str, seen: LoadedModel | None, reason: str
+    ) -> bool:
+        """True when ``model_id`` is not adopted, or its fresh check passes."""
+        if not self._is_adopted(model_id):
+            return True
+        blocked = await self._adopted_unload_blocked(model_id, seen)
+        if blocked is None:
+            return True
+        log.info(
+            "laplace.reaper: skip unload of adopted %s (%s): %s",
+            model_id,
+            reason,
+            blocked,
+        )
+        return False
 
     def is_managed(self, model_id: str) -> bool:
         if not model_id:
@@ -419,6 +502,10 @@ class Reaper:
             size_bytes = self._loaded_size_bytes.get(model_id) or self._loaded_size_bytes.get(
                 self.adapter.base_id(model_id)
             )
+            if not await self._adopted_guard_allows(
+                model_id, entry_by_id.get(model_id), "reaper:managed-idle-sweep"
+            ):
+                continue
             unloaded = await self._unload(model_id, reason="reaper:managed-idle-sweep")
             if not unloaded:
                 continue
@@ -492,6 +579,7 @@ class Reaper:
             return False
         self._cache_loaded_entries(entries)
         resident = [entry.id for entry in entries if entry.id]
+        seen_by_id = {entry.id: entry for entry in entries if entry.id}
         baseline = await headroom_mb() if headroom_mb is not None else None
         # Live path: never evict a model the runtime reports as active.
         busy = {
@@ -510,6 +598,10 @@ class Reaper:
             size_bytes = self._loaded_size_bytes.get(victim) or self._loaded_size_bytes.get(
                 self.adapter.base_id(victim)
             )
+            if not await self._adopted_guard_allows(
+                victim, seen_by_id.get(victim), "reaper:request-free"
+            ):
+                continue
             unloaded = await self._unload(victim, reason="reaper:request-free")
             if not unloaded:
                 continue
