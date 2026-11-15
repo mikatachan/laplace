@@ -19,6 +19,12 @@ DEFAULT_MAX_CONCURRENT_LMS = 2
 # How often a parked admission checks ``abandoned`` (same cadence as the proxy's
 # disconnect watch, laplace_serve/proxy.py DISCONNECT_POLL_S).
 ABANDON_POLL_S = 1.0
+# best_effort replace: unload an idle smaller copy only when the context the
+# capacity cap predicts after the unload costs at least this much more than the
+# copy. Covers the headroom drift measured between turns (largest drop 1738 MB
+# in the GLM canary, 2026-11-15 03:32) so a replace never reloads smaller, and
+# skips ~18 s reloads (3 s unload + 15 s load) for small gains.
+REPLACE_MIN_GAIN_MB = 2048
 
 
 class ContentionBroker:
@@ -456,6 +462,21 @@ class ContentionBroker:
             return None
         if need_context and allow_replace:
             victim = self._idle_smaller_copy(model_id, entries)
+            if victim is not None and not await self._replace_gains(
+                model_id, need_context, victim
+            ):
+                # Reloading would gain less than the headroom drift between
+                # turns, or could come back smaller: keep the copy.
+                self._reserve(model_id, victim.context_length)
+                log.info(
+                    "laplace.broker: load decision model=%s need_ctx=%s configured_ctx=%s "
+                    "decision=admit reason=replace-gain-below-threshold resident_ctx=%s",
+                    model_id,
+                    capped_from or need_context,
+                    context_length,
+                    victim.context_length,
+                )
+                return ("admit", victim.context_length)
             if victim is not None:
                 log.info(
                     "laplace.broker: load decision model=%s need_ctx=%s decision=replace "
@@ -590,6 +611,22 @@ class ContentionBroker:
             return None
         return copy
 
+    async def _replace_gains(
+        self, model_id: str, target_ctx: int, copy: LoadedModel
+    ) -> bool:
+        """Whether reloading ``copy`` at ``target_ctx`` gains REPLACE_MIN_GAIN_MB.
+
+        ``target_ctx`` is the need, already capped by ``_capacity_cap``. True
+        (replace, as before) when the copy's context or either cost is unknown.
+        """
+        if copy.context_length is None:
+            return True
+        target = await self._adapter.load_cost(model_id, target_ctx)
+        current = await self._adapter.load_cost(model_id, copy.context_length)
+        if target is None or current is None:
+            return True
+        return target.total_mb - current.total_mb >= REPLACE_MIN_GAIN_MB
+
     async def _live_available(
         self, entries: list[LoadedModel], resident: list[str], context_length: int | None
     ) -> tuple[int, int, tuple[str, ...], int, tuple[str, ...]] | None:
@@ -615,10 +652,15 @@ class ContentionBroker:
 
         Capacity is available headroom (after in-flight and pending reserves),
         taken from ``snapshot`` (the reading admission then decides on),
-        plus the full cost of a resident copy of this model, plus the
-        weights + overhead of idle evictable models: everything eviction or
-        replacement could free now. None when the need fits that capacity, or
-        any term is unknown (then today's behaviour: queue).
+        plus the weights + overhead of a resident copy of this model and of
+        idle evictable models: what eviction or replacement surely frees now.
+        KV is not credited, as for eviction: a copy's unload measured 6.3-8.6 GB
+        less than its full cost (GLM canary 2026-11-15 03:18, 03:21), and
+        crediting it reloaded the copy at a smaller context (03:32).
+
+        A resident copy is achievable as it is, so the cap is never below its
+        context. None when the need fits capacity, or any term is unknown
+        (then today's behaviour: queue).
         """
         need_cost = await self._adapter.load_cost(model_id, need)
         if need_cost is None or snapshot is None:
@@ -627,12 +669,14 @@ class ContentionBroker:
         resident = [entry.id for entry in entries]
         capacity = headroom - inflight_mb - pending_mb
         evictable_ids = set(self._reaper.evictable_models(resident))
+        copy_ctx = 0
         for entry in entries:
             if self._same_model(model_id, entry.id):
                 cost = await self._adapter.load_cost(entry.id, entry.context_length)
                 if cost is None:
                     return None
-                capacity += cost.total_mb
+                capacity += cost.weights_mb + cost.overhead_mb
+                copy_ctx = max(copy_ctx, entry.context_length or 0)
             elif entry.id in evictable_ids and not self._is_busy(entry):
                 cost = await self._adapter.load_cost(entry.id, entry.context_length)
                 if cost is not None:
@@ -641,7 +685,7 @@ class ContentionBroker:
             return None
         low_cost = await self._adapter.load_cost(model_id, 1)
         if low_cost is None or low_cost.total_mb > capacity:
-            return None
+            return copy_ctx if 0 < copy_ctx < need else None
         low, high = 1, need - 1
         while low < high:
             mid = (low + high + 1) // 2
@@ -650,7 +694,7 @@ class ContentionBroker:
                 low = mid
             else:
                 high = mid - 1
-        return low
+        return max(low, copy_ctx) if copy_ctx < need else low
 
     async def _fit_context_length(
         self, model_id: str, available_mb: int, need: int, ceiling: int
