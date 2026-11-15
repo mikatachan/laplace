@@ -211,6 +211,24 @@ class Reaper:
         self._mark_managed(model_id)
         self._last_used[model_id] = time.monotonic()
 
+    def adopt_resident(self, entries: list[LoadedModel]) -> list[str]:
+        """Claim models already resident at startup as daemon-managed.
+
+        Managed state lives only in memory, so after a restart every model the
+        previous process loaded reads as external: never an eviction victim,
+        unloaded only by the external-idle sweep (TTL plus sustained sweeps).
+        Adopting them makes idle ones evictable again. Trade-off: a model that
+        a client outside laplaced loaded is adopted too, and then follows the
+        managed-idle TTL instead of the runtime's lastUsedTime.
+        """
+        adopted: list[str] = []
+        for entry in entries:
+            if not entry.id or self._is_keep_loaded(entry.id):
+                continue
+            self.mark_managed(entry.id)
+            adopted.append(entry.id)
+        return adopted
+
     def is_managed(self, model_id: str) -> bool:
         if not model_id:
             return False

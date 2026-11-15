@@ -289,6 +289,28 @@ measured_eviction = true
 
 Rollback: set either flag to `false` (or delete the line) and restart laplaced.
 
+### Opt-in adoption of resident models at startup
+
+Off by default. Which models laplaced manages is held in memory, so after a
+restart every model the previous process loaded counts as an external tenant:
+it is never offered for eviction and leaves only through the external-idle
+sweep (idle past 300 s by the runtime's `lastUsedTime`, seen on two sweeps).
+A request that needs that memory waits in the meantime with
+`evictable_credit_mb=0`.
+
+```toml
+adopt_resident_on_start = true
+```
+
+With this flag, laplaced lists resident models once at startup and claims each
+one (except `keep_loaded`) as managed, logging `adopted N resident model(s)`.
+Adopted models can be evicted when idle and follow the managed-idle TTL from
+startup. Live-memory admission still skips models the runtime reports as
+busy, and the managed-idle sweep skips models it reports as active. Trade-off: a model that a client
+outside laplaced loaded is adopted too, and is then reaped on laplaced's
+managed-idle TTL rather than the runtime's `lastUsedTime`. A failed listing is
+logged and startup continues. Rollback: remove the line and restart laplaced.
+
 ## Prior art / where Laplace fits
 
 See the assessment in `docs/`. Closest adjacent tools: **llama-swap** (own-process idle TTL), **ConductorAPI** (multi-runtime budgets+priority, early-stage), **ollamaMQ** (Ollama request-priority proxy), **LocalAI** (LRU + idle watchdog). None do external-tenant-aware reaping.
