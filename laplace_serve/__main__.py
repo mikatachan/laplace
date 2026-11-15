@@ -48,6 +48,7 @@ def build_components(
         ),
         fit_context=config.fit_context_admission,
         measured_eviction=config.measured_eviction,
+        best_effort=config.fit_context_best_effort,
     )
     return adapter, reaper, broker
 
