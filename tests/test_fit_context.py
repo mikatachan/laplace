@@ -8,6 +8,7 @@ import logging
 
 import pytest
 
+from laplace.adapter import LoadCost
 from laplace.adapters.lmstudio import LMStudioAdapter
 from laplace.broker import ContentionBroker
 from laplace.reaper import Reaper
@@ -631,3 +632,87 @@ def test_best_effort_flag_is_opt_in_validated_and_wired():
     assert broker._best_effort is True
     with pytest.raises(ValueError, match="fit_context_best_effort"):
         LaplacedConfig.from_dict({"fit_context_best_effort": "yes"})
+
+
+# Two admissions that pick the same adopted idle copy must unload it once.
+# The adopted-model live recheck awaits, so the claim has to precede it.
+
+class _PausedAdoptedAdapter(FakeAdapter):
+    def __init__(self):
+        super().__init__(loaded=[loaded_model(
+            "glm", size_bytes=1_000 * _MIB, status="idle", queued=0, context_length=8192,
+        )])
+        self.list_calls = 0
+        self.guard_arrivals = 0
+        self.guards_ready = asyncio.Event()
+        self.replace_calls = []
+
+    async def load_cost(self, model_id, context_length):
+        return LoadCost(
+            weights_mb=1_000, kv_mb=(context_length or 0) // 100, overhead_mb=100,
+            context_length=context_length, parallel=1,
+        )
+
+    async def list_loaded(self):
+        self.list_calls += 1
+        # Call 1 adopts. Calls 2 and 4 are the brokers' selection snapshots.
+        # Calls 3 and 5 would be the adopted-model live rechecks; hold the first
+        # until a second arrives (or a few loop turns pass, once it is fixed).
+        if self.list_calls in (3, 5):
+            self.guard_arrivals += 1
+            if self.guard_arrivals == 2:
+                self.guards_ready.set()
+            for _ in range(100):
+                if self.guards_ready.is_set():
+                    break
+                await asyncio.sleep(0)
+        return list(self.loaded.values())
+
+    async def force_unload(self, model_id, reason=""):
+        self.replace_calls.append((model_id, reason))
+        # Keep the first unload in progress long enough for a second caller.
+        if len(self.replace_calls) == 1:
+            for _ in range(100):
+                if len(self.replace_calls) == 2:
+                    break
+                await asyncio.sleep(0)
+        # A successful unload removes the copy, as LM Studio does.
+        return await super().force_unload(model_id, reason=reason)
+
+
+@pytest.mark.asyncio
+async def test_best_effort_concurrent_replace_unloads_adopted_copy_once():
+    adapter = _PausedAdoptedAdapter()
+    reaper = Reaper(adapter)
+    assert reaper.adopt_resident(await adapter.list_loaded()) == ["glm"]
+    broker = _best_effort_broker(adapter, reaper, Probe(200_000), timeout_s=0.02)
+
+    results = await asyncio.wait_for(asyncio.gather(
+        broker.admit_sized("glm", 100_000, need_context=20_000),
+        broker.admit_sized("glm", 100_000, need_context=20_000),
+    ), timeout=5)
+
+    assert len(adapter.replace_calls) == 1, adapter.replace_calls
+    # The loser queues behind the unload (no loop, no hang), then is covered by
+    # the winner's load at the fitted context.
+    assert results == [("admit", 100_000), ("admit", 100_000)]
+    assert not reaper.is_unloading("glm")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["guard-blocks", "unload-raises"])
+async def test_replace_releases_unloading_claim_on_every_exit(how):
+    adapter = FakeAdapter(loaded=[loaded_model(
+        "glm", status="busy" if how == "guard-blocks" else "idle", queued=0,
+    )])
+    reaper = Reaper(adapter)
+    reaper.adopt_resident(await adapter.list_loaded())
+    if how == "unload-raises":
+        async def boom(model_id, *, reason=""):
+            raise RuntimeError("lms unload failed")
+        adapter.force_unload = boom
+        with pytest.raises(RuntimeError):
+            await reaper.unload_for_replace("glm")
+    else:
+        assert await reaper.unload_for_replace("glm") is False
+    assert not reaper.is_unloading("glm")

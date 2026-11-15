@@ -172,22 +172,28 @@ class Reaper:
                 reason,
             )
             return False
-        self._unloading[base_id] = self._unloading.get(base_id, 0) + 1
-        done = self._unload_done.setdefault(base_id, asyncio.Event())
+        done = self._claim_unloading(base_id)
         try:
             return await self.adapter.force_unload(model_id, reason=reason)
         finally:
-            remaining = self._unloading.get(base_id, 0) - 1
-            if remaining > 0:
-                self._unloading[base_id] = remaining
-            else:
-                self._unloading.pop(base_id, None)
-                self._unload_done.pop(base_id, None)
-                done.set()
-                wake = getattr(self._broker, "wake_waiter", None)
-                if wake is not None:
-                    # Wake an admission the broker queued behind this unload.
-                    wake()
+            self._release_unloading(base_id, done)
+
+    def _claim_unloading(self, base_id: str) -> asyncio.Event:
+        self._unloading[base_id] = self._unloading.get(base_id, 0) + 1
+        return self._unload_done.setdefault(base_id, asyncio.Event())
+
+    def _release_unloading(self, base_id: str, done: asyncio.Event) -> None:
+        remaining = self._unloading.get(base_id, 0) - 1
+        if remaining > 0:
+            self._unloading[base_id] = remaining
+        else:
+            self._unloading.pop(base_id, None)
+            self._unload_done.pop(base_id, None)
+            done.set()
+            wake = getattr(self._broker, "wake_waiter", None)
+            if wake is not None:
+                # Wake an admission the broker queued behind this unload.
+                wake()
 
     @property
     def pending_unloads(self) -> list[str]:
@@ -298,12 +304,26 @@ class Reaper:
         """Unload an idle resident copy so it can be reloaded at a larger context.
 
         Same claim checks as any reaper unload (_unload), plus the adopted-model
-        live recheck.
+        live recheck. The base is marked unloading before the recheck awaits, so
+        a concurrent admission that chose the same copy skips it here and queues
+        behind this unload (is_unloading) instead of unloading it a second time.
         """
         reason = "broker:replace-smaller-context"
-        if not await self._adopted_guard_allows(model_id, None, reason):
+        base_id = self.adapter.base_id(model_id)
+        if self._unloading.get(base_id, 0) > 0:
+            log.info(
+                "laplace.reaper: skip unload of %s (%s): already unloading",
+                model_id,
+                reason,
+            )
             return False
-        return await self._unload(model_id, reason=reason)
+        done = self._claim_unloading(base_id)
+        try:
+            if not await self._adopted_guard_allows(model_id, None, reason):
+                return False
+            return await self._unload(model_id, reason=reason)
+        finally:
+            self._release_unloading(base_id, done)
 
     def is_managed(self, model_id: str) -> bool:
         if not model_id:
