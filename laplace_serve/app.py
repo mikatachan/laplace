@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import os
+import re
 from urllib.parse import unquote
 from typing import Awaitable, Callable, Optional
 
@@ -20,6 +21,7 @@ from laplace.broker import ContentionBroker
 from laplace.reaper import Reaper
 
 from laplace_serve import origins
+from laplace_serve._token_words import COST1, COST2
 from laplace_serve.admission import govern
 from laplace_serve.auth import CallerAuthenticator
 from laplace_serve.config import LaplacedConfig
@@ -224,7 +226,9 @@ async def _governed(request: web.Request) -> web.StreamResponse:
     forwarded_body = _canonicalize_forwarded_model(body, requested_model, model)
     ctx = config.model_context.get(model, config.default_context_length) if model else None
     need_ctx = (
-        _estimate_need_tokens(body, config.fit_context_min_output_tokens)
+        _estimate_need_tokens(
+            body, config.fit_context_min_output_tokens, config.fit_context_word_estimate
+        )
         if model and config.fit_context_admission
         else None
     )
@@ -507,7 +511,9 @@ _OUTPUT_LIMIT_KEYS = ("max_tokens", "max_completion_tokens", "max_output_tokens"
 _TEMPLATE_ALLOWANCE_TOKENS = 1024
 
 
-def _estimate_need_tokens(body: bytes, min_output_tokens: int) -> int:
+def _estimate_need_tokens(
+    body: bytes, min_output_tokens: int, word_estimate: bool = False
+) -> int:
     """Upper-bound context a request needs: prompt plus output allowance.
 
     Prompt: the request body's UTF-8 byte count plus
@@ -523,6 +529,9 @@ def _estimate_need_tokens(body: bytes, min_output_tokens: int) -> int:
     body bytes. An empirical bound, not a proof for every template. For
     English it is about 4.3x the real count; a need above the configured
     context is treated as the configured context.
+    ``word_estimate`` lowers the prompt part by ``_text_savings`` of each
+    message text; everything else (JSON syntax, tools, tool-call arguments)
+    stays counted by bytes.
     Output: the caller's limit when it sends one, else ``min_output_tokens``.
     """
     prompt = len(body) + _TEMPLATE_ALLOWANCE_TOKENS
@@ -537,7 +546,72 @@ def _estimate_need_tokens(body: bytes, min_output_tokens: int) -> int:
             if isinstance(value, int) and not isinstance(value, bool) and value > 0:
                 output = value
                 break
+        if word_estimate:
+            prompt -= sum(_text_savings(text) for text in _message_texts(payload))
     return prompt + output
+
+
+# Message text is rendered verbatim by chat templates, so only it is
+# discounted. Tool schemas and arguments are not: Qwen3-Coder expands each
+# tool parameter into XML, and its byte count is what covers that expansion.
+def _message_texts(payload: dict):
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            yield content
+        elif isinstance(content, list):
+            for part in content:
+                if (
+                    isinstance(part, dict)
+                    and part.get("type") == "text"
+                    and isinstance(part.get("text"), str)
+                ):
+                    yield part["text"]
+
+
+# A word is a run of ASCII letters with no letter, digit or non-ASCII character
+# on either side, so base64, hex and identifiers glued to digits are never
+# discounted. Runs of two or more spaces are matched separately.
+_TEXT_RUN = re.compile(r" {2,}|[A-Za-z0-9\x80-\U0010ffff]+")
+_WORD_SHAPE = re.compile(r"[A-Z]?[a-z]+")
+
+
+def _text_savings(text: str) -> int:
+    """How many tokens fewer than its UTF-8 bytes a message text can cost.
+
+    Per-class costs, checked offline on the five local tokenizers named in
+    ``_estimate_need_tokens``: a word in ``COST1`` or ``COST2`` costs 1 or 2
+    tokens (lowercase or capitalised, with or without a leading space,
+    regenerated and checked by scripts/gen-token-words.py), and a single
+    space before such a word is free. A run of k spaces costs ceil(k / 16)
+    (one token holds 31 spaces on Gemma 4, at least 64 on the others). Every
+    other character keeps its byte count. The text's JSON escaping in the body
+    is not discounted, so the saving never exceeds the bytes the text adds.
+    """
+    saved = 0
+    for match in _TEXT_RUN.finditer(text):
+        run = match.group()
+        if run[0] == " ":
+            saved += len(run) - -(-len(run) // 16)
+            continue
+        if not _WORD_SHAPE.fullmatch(run):
+            continue
+        word = run.lower()
+        if word in COST1:
+            cost = 1
+        elif word in COST2:
+            cost = 2
+        else:
+            continue
+        start = match.start()
+        lead = start > 0 and text[start - 1] == " " and (start < 2 or text[start - 2] != " ")
+        saved += len(run) - cost + lead
+    return saved
 
 
 def _canonicalize_forwarded_model(
