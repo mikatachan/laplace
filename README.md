@@ -312,6 +312,32 @@ Rollback: set either flag to `false` (or delete the line) and restart laplaced.
   turns and skips a ~18 s reload for a small gain. Otherwise the copy is used
   as is (`reason=replace-gain-below-threshold`).
 
+`fit_context_word_estimate = true` (off by default, needs
+`fit_context_admission`) tightens the prompt part of the need. Message text
+(`content` strings and `text` parts) is costed per word instead of per byte:
+a word from the generated lists in `laplace_serve/_token_words.py` costs 1 or
+2 tokens (lowercase or capitalised, a single space before it is free), a run
+of k spaces costs ceil(k / 16), and every other character keeps one token per
+byte. JSON syntax, tool schemas and tool-call arguments stay at bytes, because
+templates can expand them (Qwen3-Coder renders each tool parameter as XML).
+The 1024-token template allowance and the output allowance are unchanged.
+
+Measured offline on five local tokenizers (GLM-4.5-Air, gpt-oss-120b,
+Qwen3-Coder-30B, Qwen3-Next-80B, Gemma 4 26B), chat template applied, on
+synthetic requests built from site-packages code and docs that the word lists
+were not drawn from (13 requests, 65 counts): the median estimate fell from
+3.89x to 2.20x the real prompt tokens (worst 5.70x to 3.14x, lowest 1.83x).
+No seeded adversarial request (digits, punctuation, CJK, emoji, empty
+messages, base64, hex, minified JSON, code, random words, listed words only)
+was estimated below its real count; the corpus and counts are in
+`tests/test_need_estimate.py`. It is an empirical bound like the byte one:
+text made only of listed words is estimated at its exact count, so the
+template allowance is the margin there. The word lists hold only for the
+tokenizers they were checked on: after adding a model with another tokenizer,
+run `scripts/gen-token-words.py --check` with its directory, and re-measure
+with `scripts/measure-need-estimate.py`. Costing a 480 KB body takes about
+25 ms on the event loop. Rollback: remove the line and restart laplaced.
+
 ### Opt-in: cancel a queued admission when its client disconnects
 
 `cancel_admission_on_disconnect = true` (off by default). aiohttp does not

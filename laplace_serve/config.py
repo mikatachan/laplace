@@ -82,6 +82,9 @@ class LaplacedConfig:
     # smaller resident copy of the same model at once instead of waiting for
     # the reaper's idle unload.
     fit_context_best_effort: bool = False
+    # Opt-in, needs fit_context_admission: estimate message text by per-word
+    # token costs measured offline instead of one token per byte.
+    fit_context_word_estimate: bool = False
     # Opt-in: end a queued admission when its client disconnects, so no load
     # or eviction runs for a caller that is gone.
     cancel_admission_on_disconnect: bool = False
@@ -197,6 +200,7 @@ class LaplacedConfig:
             "fit_context_admission",
             "measured_eviction",
             "fit_context_best_effort",
+            "fit_context_word_estimate",
             "adopt_resident_on_start",
             "cancel_admission_on_disconnect",
         ):
