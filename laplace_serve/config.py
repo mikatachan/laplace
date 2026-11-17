@@ -72,6 +72,8 @@ class LaplacedConfig:
     # Output allowance when a request sends no max_tokens. No existing setting
     # covered it; 8192 is a starting value, not a measurement.
     fit_context_min_output_tokens: int = 8192
+    # Opt-in: a request with no max_tokens may use the model's whole configured window for output (need = configured context). The caller's own max_tokens always wins. Off keeps fit_context_min_output_tokens.
+    fit_context_output_from_window: bool = False
     # Opt-in, needs live_memory_admission: once per admission, evict idle
     # managed models even when their estimated credit is below the shortfall,
     # then decide again on measured headroom.
@@ -198,6 +200,7 @@ class LaplacedConfig:
             raise ValueError("laplaced config: live_memory_admission must be a boolean")
         for flag in (
             "fit_context_admission",
+            "fit_context_output_from_window",
             "measured_eviction",
             "fit_context_best_effort",
             "fit_context_word_estimate",

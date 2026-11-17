@@ -254,6 +254,7 @@ add to `~/.laplace/laplaced.toml` and restart laplaced:
 fit_context_admission = true
 measured_eviction = true
 # fit_context_min_output_tokens = 8192   # default
+# fit_context_output_from_window = false   # default
 ```
 
 - **`fit_context_admission`**: each request gets a context need: the request
@@ -286,6 +287,16 @@ measured_eviction = true
   once per request: a request that still does not fit waits, and it never
   evicts again on a later wake, by either the measured or the credit-based
   path (`decision=evict-measured` in the log).
+
+- **`fit_context_output_from_window`** (off by default, needs
+  `fit_context_admission`): a request that sends no `max_tokens` (or
+  `max_completion_tokens` / `max_output_tokens`) uses the model's configured
+  context as its output allowance instead of `fit_context_min_output_tokens`,
+  so output room depends on the task and the model rather than a fixed floor.
+  A caller's own limit still wins. Its need is then always the configured
+  context, so such a request cannot use a smaller fit-sized load: it waits for
+  a load at the configured context unless `fit_context_best_effort` caps the
+  need.
 
 Rollback: set either flag to `false` (or delete the line) and restart laplaced.
 
