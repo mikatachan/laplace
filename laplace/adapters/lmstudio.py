@@ -11,7 +11,7 @@ import os
 import time
 from dataclasses import dataclass
 
-from laplace.adapter import LoadCost, LoadedModel, ModelLoadError
+from laplace.adapter import LoadCost, LoadedModel, LoadGuardActive, ModelLoadError
 
 log = logging.getLogger(__name__)
 
@@ -411,11 +411,13 @@ class LMStudioAdapter:
             if base != requested_base and pending.reason != "timeout":
                 continue
             deadline = pending.started_at + pending.window_s
-            if time.monotonic() < deadline:
-                raise ModelLoadError(
+            now = time.monotonic()
+            if now < deadline:
+                raise LoadGuardActive(
                     f"lmstudio load outcome unresolved for requested {base}; "
                     f"cold loads blocked during {pending.reason} window "
-                    f"({pending.window_s:g}s)"
+                    f"({pending.window_s:g}s)",
+                    retry_after_s=deadline - now,
                 )
             # A known other catalog model is not evidence of a fuzzy result.
             # Unknown new identities cannot safely be attributed or ignored.

@@ -417,6 +417,16 @@ broker's resident-memory budget. Resident admissions still use the fast path.
 `load_grace_s` defaults to 90 seconds and is configurable on `LMStudioAdapter` and
 as a top-level `laplaced.toml` option.
 
+laplaced queues a request refused only by that window (`LoadGuardActive`) instead
+of returning 503. It releases its admission reservation, waits until the window
+ends while holding no lock (polling for client disconnect when
+`cancel_admission_on_disconnect` is on), then goes through admission and the
+load path again. The first admission, any guard waits, and re-admission share
+the one `admit_timeout_s`: a window that would outlast what is left of it fails
+at once with the 503 and `Retry-After` as before. No cold load starts inside
+the window. The operator-reconciliation and fuzzy-load failures below are not
+timed and still fail immediately.
+
 Each admission takes a fresh inventory. A matching resident reconciles uncertainty;
 after the deadline, no new matching or unidentified instance marks the attempt
 failed and permits retry. Failed inventory reads retain the restriction. Known

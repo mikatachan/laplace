@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from laplace.adapter import ModelLoadError
+from laplace.adapter import LoadGuardActive, ModelLoadError
 from laplace.broker import ContentionBroker
 from laplace.reaper import Reaper
 from laplace_serve.admission import govern
@@ -374,3 +374,125 @@ async def test_admission_waits_for_inflight_duplicate_reap_of_same_base():
         f"ensure_loaded:{_RACE_MODEL}",
         "proxy:admit",
     ]
+
+
+# --- Timed load guard: wait the window out, then admit again ---
+
+
+class _GuardAdapter(FakeAdapter):
+    """ensure_loaded refuses with a timed guard ``guards`` times, then loads."""
+
+    def __init__(self, *, guards, retry_after_s, **kwargs):
+        super().__init__(**kwargs)
+        self.guards = guards
+        self.retry_after_s = retry_after_s
+
+    async def ensure_loaded(self, model_id, context_length):
+        if self.guards:
+            self.ensure_loaded_calls.append((model_id, context_length))
+            self.guards -= 1
+            raise LoadGuardActive("cold loads blocked during rc window", self.retry_after_s)
+        await FakeAdapter.ensure_loaded(self, model_id, context_length)
+
+
+@pytest.mark.asyncio
+async def test_guard_wait_is_abandoned_when_client_leaves(monkeypatch):
+    from laplace_serve import admission
+
+    adapter = _GuardAdapter(guards=1, retry_after_s=80.0, footprints={_MODEL: 48000})
+    reaper = Reaper(adapter)
+    broker = ContentionBroker(adapter, reaper, budget_mb=90000)
+    sleeps = []
+    gone = False
+
+    async def fake_sleep(seconds):
+        nonlocal gone
+        assert broker._active_calls() == 0
+        sleeps.append(seconds)
+        if len(sleeps) == 3:
+            gone = True
+
+    monkeypatch.setattr(admission, "_sleep", fake_sleep)
+    async with govern(
+        broker, reaper, adapter,
+        model=_MODEL, ctx=131072, tier="interactive", fail_open=False,
+        abandoned=lambda: gone,
+    ) as adm:
+        assert adm.decision == "abandoned"
+
+    assert sleeps == [admission.ABANDON_POLL_S] * 3
+    assert len(adapter.ensure_loaded_calls) == 1
+    assert broker._active_calls() == 0
+    assert reaper.is_managed(_MODEL) is False
+
+
+@pytest.mark.asyncio
+async def test_guard_longer_than_admission_timeout_fails_without_waiting(monkeypatch):
+    from laplace_serve import admission
+
+    adapter = _GuardAdapter(guards=1, retry_after_s=50.0, footprints={_MODEL: 48000})
+    reaper = Reaper(adapter)
+    broker = ContentionBroker(adapter, reaper, budget_mb=90000, timeout_s=10.0)
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(admission, "_sleep", fake_sleep)
+    with pytest.raises(LoadGuardActive):
+        async with govern(
+            broker, reaper, adapter,
+            model=_MODEL, ctx=131072, tier="interactive", fail_open=True,
+        ):
+            pass
+
+    assert sleeps == []
+    assert broker._active_calls() == 0
+
+
+@pytest.mark.asyncio
+async def test_repeated_guards_share_one_admission_timeout():
+    """Real sleeps: guards keep reopening, so the overall timeout ends the wait."""
+    adapter = _GuardAdapter(guards=10_000, retry_after_s=0.1, footprints={_MODEL: 48000})
+    reaper = Reaper(adapter)
+    broker = ContentionBroker(adapter, reaper, budget_mb=90000, timeout_s=0.5)
+    started = time.monotonic()
+    with pytest.raises(LoadGuardActive):
+        async with govern(
+            broker, reaper, adapter,
+            model=_MODEL, ctx=131072, tier="interactive", fail_open=False,
+        ):
+            pass
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.5
+    assert 2 <= len(adapter.ensure_loaded_calls) <= 6
+    assert broker._active_calls() == 0
+
+
+@pytest.mark.asyncio
+async def test_guard_wait_then_admits_and_loads(monkeypatch):
+    from laplace_serve import admission
+
+    adapter = _GuardAdapter(guards=1, retry_after_s=80.0, footprints={_MODEL: 48000})
+    reaper = Reaper(adapter)
+    broker = ContentionBroker(adapter, reaper, budget_mb=90000)
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        assert not broker._lock.locked()
+        assert broker._active_calls() == 0
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(admission, "_sleep", fake_sleep)
+    async with govern(
+        broker, reaper, adapter,
+        model=_MODEL, ctx=131072, tier="interactive", fail_open=False,
+    ) as adm:
+        assert adm.decision == "admit"
+        assert broker._active_calls() == 1
+
+    # No abandon callback: one sleep for the whole window.
+    assert sleeps == [pytest.approx(80.0 + admission.GUARD_RETRY_MARGIN_S)]
+    assert len(adapter.ensure_loaded_calls) == 2
+    assert broker._active_calls() == 0

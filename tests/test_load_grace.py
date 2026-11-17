@@ -271,3 +271,27 @@ async def test_matching_late_instance_clears_timeout_before_deadline(clock):
     await rt.adapter.ensure_loaded(A, 4096)
     await rt.adapter.ensure_loaded(B, 4096)
     assert rt.loads == [A, B]
+
+
+@pytest.mark.asyncio
+async def test_timed_guard_raises_load_guard_active_with_time_left(clock):
+    rt = timeout_runtime(clock)
+    with pytest.raises(ModelLoadError) as first:
+        await rt.adapter.ensure_loaded(A, 4096)
+    assert not isinstance(first.value, lmstudio.LoadGuardActive)
+    clock.now = 120  # window: load start 100 + timeout 10 + grace 90 = 200
+    with pytest.raises(lmstudio.LoadGuardActive) as guard:
+        await rt.adapter.ensure_loaded(A, 4096)
+    assert guard.value.retry_after_s == pytest.approx(80.0)
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_required_is_not_a_timed_guard(clock):
+    rt = timeout_runtime(clock)
+    with pytest.raises(ModelLoadError):
+        await rt.adapter.ensure_loaded(A, 4096)
+    rt.rows = [resident('unidentified-stranger')]
+    clock.now = 200
+    with pytest.raises(ModelLoadError, match='operator reconciliation required') as exc:
+        await rt.adapter.ensure_loaded(A, 4096)
+    assert not isinstance(exc.value, lmstudio.LoadGuardActive)

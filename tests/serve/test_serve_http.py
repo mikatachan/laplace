@@ -474,11 +474,17 @@ async def test_guarded_load_refusal_returns_capped_rounded_up_retry_after(
 
     upstream = web.Application()
     upstream.router.add_post("/v1/chat/completions", chat)
+    # Every window here outlasts the admission timeout, so the request fails
+    # at once instead of waiting the window out.
+    reaper = Reaper(adapter, delay_seconds=300.0)
+    broker = ContentionBroker(adapter, reaper, budget_mb=90000, timeout_s=5.0)
 
     async with make_harness(
         upstream_app=upstream,
         upstream_state=state,
         adapter=adapter,
+        reaper=reaper,
+        broker=broker,
     ) as h:
         resp = await h.client.post(
             "/hermes/v1/chat/completions",
@@ -489,6 +495,144 @@ async def test_guarded_load_refusal_returns_capped_rounded_up_retry_after(
         assert resp.status == 503
         assert resp.headers["Retry-After"] == expected
 
+    assert state.requests == []
+
+
+def _guard_runtime(monkeypatch, *, rows_after_load):
+    """An LM Studio adapter whose first load was canceled at t=100.
+
+    The rc guard window (default grace 90 s) then runs t=100..190. Later loads
+    succeed and leave ``rows_after_load`` resident. Returns (adapter, clock,
+    loads).
+    """
+    clock = SimpleNamespace(now=100.0)
+    loads: list[str] = []
+    rows: list[dict] = []
+    adapter = lmstudio.LMStudioAdapter(load_timeout_s=300, footprint_overrides={"m": 100})
+
+    async def run(args, timeout):
+        if args[0] == "ps":
+            return 0, json.dumps(rows), ""
+        if args[0] == "ls":
+            return 0, '[{"modelKey": "m"}]', ""
+        if args[0] == "load":
+            loads.append(args[1])
+            if len(loads) == 1:
+                return 1, "", "Operation canceled"
+            rows[:] = rows_after_load
+            return 0, "", ""
+        return 1, "", "unexpected"
+
+    monkeypatch.setattr(lmstudio, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    adapter._run = run
+    return adapter, clock, loads
+
+
+@pytest.mark.asyncio
+async def test_request_inside_guard_window_waits_then_loads_and_proxies(monkeypatch):
+    """10 s into a 90 s verify window: wait ~80 s, then load and return 200."""
+    from laplace_serve import admission
+
+    state = UpstreamState()
+    adapter, clock, loads = _guard_runtime(
+        monkeypatch,
+        rows_after_load=[{"identifier": "m", "modelKey": "m", "contextLength": 10_000_000}],
+    )
+    with pytest.raises(ModelLoadError):
+        await adapter.ensure_loaded("m", 64000)
+    clock.now = 110.0
+
+    reaper = Reaper(adapter, delay_seconds=300.0)
+    broker = ContentionBroker(adapter, reaper, budget_mb=90000)
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds):
+        # The waiting request holds no broker lock, no reservation, and no
+        # adapter load lock, and nothing has been loaded yet.
+        assert not broker._lock.locked()
+        assert broker._active_calls() == 0
+        assert not adapter._load_lock.locked()
+        assert loads == ["m"]
+        sleeps.append(seconds)
+        clock.now += seconds
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(admission, "_sleep", fake_sleep)
+
+    async def chat(request):
+        _record(state, request, await request.read())
+        return web.json_response({"ok": True})
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/chat/completions", chat)
+
+    async with make_harness(
+        upstream_app=upstream, upstream_state=state, adapter=adapter,
+        reaper=reaper, broker=broker,
+    ) as h:
+        resp = await h.client.post(
+            "/hermes/v1/chat/completions",
+            data=_json_body(model="m"),
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status == 200
+        assert await resp.json() == {"ok": True}
+
+    assert loads == ["m", "m"]
+    assert sum(sleeps) == pytest.approx(80.0 + admission.GUARD_RETRY_MARGIN_S)
+    assert len(state.requests) == 1
+    assert broker._active_calls() == 0
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_required_still_fails_without_waiting(monkeypatch):
+    """After the window, an unidentified new instance fails at once (503)."""
+    from laplace_serve import admission
+
+    state = UpstreamState()
+    adapter, clock, loads = _guard_runtime(monkeypatch, rows_after_load=[])
+    with pytest.raises(ModelLoadError):
+        await adapter.ensure_loaded("m", 64000)
+    clock.now = 200.0  # past the window
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(admission, "_sleep", fake_sleep)
+
+    async def ps_with_stranger(args, timeout):
+        if args[0] == "ps":
+            stranger = {"identifier": "stranger", "contextLength": 4096, "sizeBytes": 1 << 20}
+            return 0, json.dumps([stranger]), ""
+        if args[0] == "ls":
+            return 0, '[{"modelKey": "m"}]', ""
+        if args[0] == "load":
+            loads.append(args[1])
+        return 0, "", ""
+
+    adapter._run = ps_with_stranger
+
+    async def chat(request):
+        _record(state, request, await request.read())
+        return web.json_response({"ok": True})
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/chat/completions", chat)
+
+    async with make_harness(upstream_app=upstream, upstream_state=state, adapter=adapter) as h:
+        resp = await h.client.post(
+            "/hermes/v1/chat/completions",
+            data=_json_body(model="m"),
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status == 503
+        assert (await resp.json())["error"] == "model unavailable; load did not complete"
+
+    assert sleeps == []
+    assert loads == ["m"]
     assert state.requests == []
 
 
