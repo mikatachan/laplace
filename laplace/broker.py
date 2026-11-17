@@ -75,6 +75,11 @@ class ContentionBroker:
         self._best_effort = best_effort
         self._reaper.set_broker(self)
 
+    @property
+    def timeout_s(self) -> float:
+        """The configured admission timeout."""
+        return self._timeout
+
     async def admit(
         self,
         model_id: str,
@@ -82,9 +87,10 @@ class ContentionBroker:
         priority: str = "scheduled",
         *,
         abandoned: Callable[[], bool] | None = None,
+        timeout_s: float | None = None,
     ) -> str:
         decision, _ = await self.admit_sized(
-            model_id, context_length, priority, abandoned=abandoned
+            model_id, context_length, priority, abandoned=abandoned, timeout_s=timeout_s
         )
         return decision
 
@@ -96,6 +102,7 @@ class ContentionBroker:
         *,
         need_context: int | None = None,
         abandoned: Callable[[], bool] | None = None,
+        timeout_s: float | None = None,
     ) -> tuple[str, int | None]:
         """Admit like ``admit`` and also return the context to load or reuse at.
 
@@ -112,6 +119,9 @@ class ContentionBroker:
         on and a need given, a load that does not fit at the configured
         context is admitted at the largest context that fits, if that covers
         the need. Without them the returned context is ``context_length``.
+
+        ``timeout_s`` (optional) replaces the configured admission timeout for
+        this call, so a caller that already waited can keep one overall budget.
         """
         if not model_id:
             return "admit", context_length
@@ -131,7 +141,7 @@ class ContentionBroker:
             tier = PriorityTier.SCHEDULED
 
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + self._timeout
+        deadline = loop.time() + (self._timeout if timeout_s is None else timeout_s)
         evicted_this_cycle = False
         # After a measured (credit < shortfall) eviction this admission never
         # evicts again, by either branch, so it cannot evict, fail to fit, and

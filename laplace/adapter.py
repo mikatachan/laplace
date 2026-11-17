@@ -10,6 +10,18 @@ class ModelLoadError(RuntimeError):
     """The runtime could not make the requested model ready for inference."""
 
 
+class LoadGuardActive(ModelLoadError):
+    """Cold loads are blocked only until a timed guard window ends.
+
+    ``retry_after_s`` is the time left in that window. Callers may wait it
+    out and retry through admission; no load starts inside the window.
+    """
+
+    def __init__(self, message: str, retry_after_s: float):
+        super().__init__(message)
+        self.retry_after_s = retry_after_s
+
+
 @dataclass
 class LoadedModel:
     """A loaded model instance reported by an inference runtime.
