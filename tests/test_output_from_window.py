@@ -62,3 +62,35 @@ def test_output_allowance_flag_on_no_ctx_falls_back() -> None:
         fit_context_min_output_tokens=8192, fit_context_output_from_window=True
     )
     assert _output_allowance(config, None) == 8192
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag", [False, True])
+async def test_request_path_passes_allowance_to_need(monkeypatch, flag):
+    from aiohttp import web
+
+    import laplace_serve.app as app_mod
+    from tests.serve.harness import make_harness
+
+    seen = []
+
+    async def fake_route(request, origin, tier, model, stream, ctx, body, need_ctx):
+        seen.append((ctx, need_ctx, body))
+        return web.json_response({"ok": True})
+
+    monkeypatch.setattr(app_mod, "_route", fake_route)
+    config = LaplacedConfig(
+        reaper_sweep=False,
+        fit_context_admission=True,
+        fit_context_min_output_tokens=8192,
+        fit_context_output_from_window=flag,
+        model_context={"m": 131072},
+    )
+    async with make_harness(upstream_app=web.Application(), config=config) as h:
+        resp = await h.client.post("/v1/completions", json={"model": "m", "prompt": "hi"})
+        assert resp.status == 200
+    assert len(seen) == 1
+    ctx, need_ctx, body = seen[0]
+    assert ctx == 131072
+    allowance = 131072 if flag else 8192
+    assert need_ctx == _estimate_need_tokens(body, allowance)
