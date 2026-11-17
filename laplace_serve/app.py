@@ -225,9 +225,10 @@ async def _governed(request: web.Request) -> web.StreamResponse:
     model = config.canonical_model_id(requested_model)
     forwarded_body = _canonicalize_forwarded_model(body, requested_model, model)
     ctx = config.model_context.get(model, config.default_context_length) if model else None
+    allowance = _output_allowance(config, ctx)
     need_ctx = (
         _estimate_need_tokens(
-            body, config.fit_context_min_output_tokens, config.fit_context_word_estimate
+            body, allowance, config.fit_context_word_estimate
         )
         if model and config.fit_context_admission
         else None
@@ -509,6 +510,19 @@ _OUTPUT_LIMIT_KEYS = ("max_tokens", "max_completion_tokens", "max_output_tokens"
 # prompts and tool-calling instructions. Worst seen: Qwen3-Coder rendered a
 # 222-byte request with one tool to 257 tokens (see _estimate_need_tokens).
 _TEMPLATE_ALLOWANCE_TOKENS = 1024
+
+
+def _output_allowance(config: LaplacedConfig, ctx: int | None) -> int:
+    """Output allowance for a request that sends no max_tokens.
+
+    With ``fit_context_output_from_window`` on and a configured context
+    available, the model's whole window is allowed; otherwise the fixed
+    ``fit_context_min_output_tokens`` applies. A caller's own max_tokens always
+    wins (see ``_estimate_need_tokens``).
+    """
+    if config.fit_context_output_from_window and ctx:
+        return ctx
+    return config.fit_context_min_output_tokens
 
 
 def _estimate_need_tokens(
