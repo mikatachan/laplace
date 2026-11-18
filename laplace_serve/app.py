@@ -225,7 +225,7 @@ async def _governed(request: web.Request) -> web.StreamResponse:
     model = config.canonical_model_id(requested_model)
     forwarded_body = _canonicalize_forwarded_model(body, requested_model, model)
     ctx = config.model_context.get(model, config.default_context_length) if model else None
-    allowance = _output_allowance(config, ctx)
+    allowance = _output_allowance(config, ctx, origin)
     need_ctx = (
         _estimate_need_tokens(
             body, allowance, config.fit_context_word_estimate
@@ -512,15 +512,22 @@ _OUTPUT_LIMIT_KEYS = ("max_tokens", "max_completion_tokens", "max_output_tokens"
 _TEMPLATE_ALLOWANCE_TOKENS = 1024
 
 
-def _output_allowance(config: LaplacedConfig, ctx: int | None) -> int:
+def _output_allowance(
+    config: LaplacedConfig, ctx: int | None, origin: str | None = None
+) -> int:
     """Output allowance for a request that sends no max_tokens.
 
     With ``fit_context_output_from_window`` on and a configured context
     available, the model's whole window is allowed; otherwise the fixed
     ``fit_context_min_output_tokens`` applies. A caller's own max_tokens always
-    wins (see ``_estimate_need_tokens``).
+    wins (see ``_estimate_need_tokens``). An origin listed in
+    fit_context_output_from_window_origins gets the same behaviour with the
+    global flag off.
     """
-    if config.fit_context_output_from_window and ctx:
+    on = config.fit_context_output_from_window or (
+        origin is not None and origin in config.fit_context_output_from_window_origins
+    )
+    if on and ctx:
         return ctx
     return config.fit_context_min_output_tokens
 

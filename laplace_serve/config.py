@@ -74,6 +74,9 @@ class LaplacedConfig:
     fit_context_min_output_tokens: int = 8192
     # Opt-in: a request with no max_tokens may use the model's whole configured window for output (need = configured context). The caller's own max_tokens always wins. Off keeps fit_context_min_output_tokens.
     fit_context_output_from_window: bool = False
+    # Origins that get fit_context_output_from_window even when the global flag
+    # is off (e.g. ["hermes"]). Empty = only the global flag decides.
+    fit_context_output_from_window_origins: tuple[str, ...] = ()
     # Opt-in, needs live_memory_admission: once per admission, evict idle
     # managed models even when their estimated credit is below the shortfall,
     # then decide again on measured headroom.
@@ -263,6 +266,16 @@ class LaplacedConfig:
         kwargs = {key: value for key, value in raw.items() if key in known}
         if "keep_loaded" in kwargs and kwargs["keep_loaded"] is not None:
             kwargs["keep_loaded"] = tuple(kwargs["keep_loaded"])
+        if "fit_context_output_from_window_origins" in kwargs:
+            names = kwargs["fit_context_output_from_window_origins"]
+            if not isinstance(names, (list, tuple)) or not all(
+                isinstance(n, str) and n for n in names
+            ):
+                raise ValueError(
+                    "laplaced config: fit_context_output_from_window_origins "
+                    "must be a list of non-empty strings"
+                )
+            kwargs["fit_context_output_from_window_origins"] = tuple(names)
         if "upstream_auth_command" in kwargs:
             command = kwargs["upstream_auth_command"]
             if (
