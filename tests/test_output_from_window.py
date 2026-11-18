@@ -94,3 +94,77 @@ async def test_request_path_passes_allowance_to_need(monkeypatch, flag):
     assert ctx == 131072
     allowance = 131072 if flag else 8192
     assert need_ctx == _estimate_need_tokens(body, allowance)
+
+
+def test_output_allowance_listed_origin_uses_window() -> None:
+    config = LaplacedConfig(
+        fit_context_min_output_tokens=8192,
+        fit_context_output_from_window=False,
+        fit_context_output_from_window_origins=("hermes",),
+    )
+    assert _output_allowance(config, 262144, "hermes") == 262144
+
+
+def test_output_allowance_unlisted_origin_keeps_min() -> None:
+    config = LaplacedConfig(
+        fit_context_min_output_tokens=8192,
+        fit_context_output_from_window=False,
+        fit_context_output_from_window_origins=("hermes",),
+    )
+    assert _output_allowance(config, 262144, "openclaw") == 8192
+
+
+def test_output_allowance_no_origin_keeps_min() -> None:
+    config = LaplacedConfig(
+        fit_context_min_output_tokens=8192,
+        fit_context_output_from_window=False,
+        fit_context_output_from_window_origins=("hermes",),
+    )
+    assert _output_allowance(config, 262144, None) == 8192
+
+
+def test_from_dict_parses_origins_list() -> None:
+    config = LaplacedConfig.from_dict(
+        {"fit_context_output_from_window_origins": ["hermes"]}
+    )
+    assert config.fit_context_output_from_window_origins == ("hermes",)
+
+
+def test_from_dict_rejects_bad_origins() -> None:
+    with pytest.raises(ValueError, match="fit_context_output_from_window_origins"):
+        LaplacedConfig.from_dict({"fit_context_output_from_window_origins": "hermes"})
+    with pytest.raises(ValueError, match="fit_context_output_from_window_origins"):
+        LaplacedConfig.from_dict({"fit_context_output_from_window_origins": [""]})
+
+
+@pytest.mark.asyncio
+async def test_request_path_listed_origin_gets_window(monkeypatch):
+    from aiohttp import web
+
+    import laplace_serve.app as app_mod
+    from tests.serve.harness import make_harness
+
+    seen = []
+
+    async def fake_route(request, origin, tier, model, stream, ctx, body, need_ctx):
+        seen.append((ctx, need_ctx, body))
+        return web.json_response({"ok": True})
+
+    monkeypatch.setattr(app_mod, "_route", fake_route)
+    config = LaplacedConfig(
+        reaper_sweep=False,
+        fit_context_admission=True,
+        fit_context_min_output_tokens=8192,
+        fit_context_output_from_window=False,
+        fit_context_output_from_window_origins=("hermes",),
+        model_context={"m": 131072},
+    )
+    async with make_harness(upstream_app=web.Application(), config=config) as h:
+        resp = await h.client.post(
+            "/hermes/v1/completions", json={"model": "m", "prompt": "hi"}
+        )
+        assert resp.status == 200
+    assert len(seen) == 1
+    ctx, need_ctx, body = seen[0]
+    assert ctx == 131072
+    assert need_ctx == _estimate_need_tokens(body, 131072)
